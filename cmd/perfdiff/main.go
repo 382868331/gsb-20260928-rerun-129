@@ -3,9 +3,10 @@
 //
 // 它演示：
 //  1. 把多批人工样本汇成可追溯的执行树（含递归、缺失符号）；
-//  2. 自身耗时与包含耗时分开统计；
-//  3. 合并批次后用总权重对账；
-//  4. 比较同一程序两个版本在相同调用路径上的变化。
+//  2. 符号资料补全后对同一批原始样本重新解释（权重守恒）；
+//  3. 内联层次展开、同名函数按模块区分身份；
+//  4. 跨构建版本按 Move 映射 + 样本锚点对应调用路径；
+//  5. 比较报告区分“符号变化”“样本变化”“未匹配”。
 package main
 
 import (
@@ -62,6 +63,109 @@ func main() {
 	for _, c := range cmp.Changes {
 		if !c.InOld && c.InNew {
 			fmt.Printf("  + %s total=%.0f\n", c.FullName(), c.NewTotal)
+		}
+	}
+
+	demoReinterpretAndMapping()
+}
+
+// demoReinterpretAndMapping 用第二组人工样本演示符号补全、内联展开、
+// 跨版本函数移动，以及比较报告如何区分符号变化与样本变化。
+func demoReinterpretAndMapping() {
+	fmt.Println("\n=== 符号补全：同一批原始样本重新解释（地址/权重不变）===")
+	raw := []perfsample.Sample{
+		{ID: "p1", Weight: 3, Stack: []perfsample.Frame{
+			{Symbol: "main"},
+			{Missing: true, Addr: 0x4010},
+			{Symbol: "encode"},
+		}, Prov: perfsample.Provenance{Source: "manual", SymbolVersion: "sym-old", Batch: "b5"}},
+		{ID: "p2", Weight: 2, Stack: []perfsample.Frame{
+			{Symbol: "main"},
+			{Missing: true, Addr: 0x4010},
+		}, Prov: perfsample.Provenance{Source: "manual", SymbolVersion: "sym-old", Batch: "b5"}},
+	}
+	treeRaw := perfsample.NewTree()
+	rw, rn := treeRaw.AddBatch(raw)
+
+	// 新符号资料：0x4010 解析为 libfoo.so!decode；
+	// encode 物理帧其实内联了 compress（内联层次 1）。
+	resolver := perfsample.ResolverFunc(func(f perfsample.Frame) []perfsample.FrameInfo {
+		switch {
+		case f.Missing && f.Addr == 0x4010:
+			return []perfsample.FrameInfo{{Module: "libfoo.so", Symbol: "decode"}}
+		case f.Symbol == "encode":
+			return []perfsample.FrameInfo{
+				{Symbol: "compress", InlineLevel: 1},
+				{Symbol: "encode", InlineLevel: 0},
+			}
+		default:
+			return nil
+		}
+	})
+	re := perfsample.Reinterpret(raw, resolver)
+	treeResolved := perfsample.NewTree()
+	nw, nn := treeResolved.AddBatch(re)
+	fmt.Print(treeResolved)
+	fmt.Printf("权重守恒核对: 原始 %.0f/%d, 重新解释后 %.0f/%d\n", rw, rn, nw, nn)
+	if rw != nw || rn != nn {
+		fmt.Println("  !! 重新解释改变了权重，违反不变量")
+	}
+
+	fmt.Println("\n=== 跨构建版本对应：decode 从 libfoo.so 移动到 libbar.so ===")
+	// 新构建的另一批样本：decode 移动了模块，但 p1/p2 采样占比不变；
+	// 另外 encode 真的变快（3 -> 1），这是样本变化而非符号变化。
+	build2 := perfsample.NewTree()
+	w2, n2 := build2.AddBatch([]perfsample.Sample{
+		{ID: "p1", Weight: 1, Stack: []perfsample.Frame{
+			{Symbol: "main"},
+			{Symbol: "decode", Module: "libbar.so"},
+			{Symbol: "compress", InlineLevel: 1},
+			{Symbol: "encode"},
+		}, Prov: perfsample.Provenance{Source: "manual", SymbolVersion: "sym-new", Batch: "b6"}},
+		{ID: "p2", Weight: 2, Stack: []perfsample.Frame{
+			{Symbol: "main"},
+			{Symbol: "decode", Module: "libbar.so"},
+		}, Prov: perfsample.Provenance{Source: "manual", SymbolVersion: "sym-new", Batch: "b6"}},
+	})
+	_ = w2
+	_ = n2
+	mapping := perfsample.NewMapping(perfsample.Move{
+		OldModule: "libfoo.so", OldSymbol: "decode",
+		NewModule: "libbar.so", NewSymbol: "decode",
+	})
+	// 先看一组采样占比完全相同、只有函数搬家的样本：
+	// 报告必须标成 symbol（纯符号变化），delta 为 0。
+	sameOld := perfsample.NewTree()
+	sameOld.AddBatch([]perfsample.Sample{{ID: "q", Weight: 4, Stack: []perfsample.Frame{
+		{Symbol: "main"}, {Symbol: "decode", Module: "libfoo.so"},
+	}}})
+	sameNew := perfsample.NewTree()
+	sameNew.AddBatch([]perfsample.Sample{{ID: "q", Weight: 4, Stack: []perfsample.Frame{
+		{Symbol: "main"}, {Symbol: "decode", Module: "libbar.so"},
+	}}})
+	sameCmp := perfsample.CompareMapped(sameOld, sameNew, mapping)
+	fmt.Println("采样占比不变、仅模块移动（应为 symbol，delta=0）:")
+	for _, c := range sameCmp.Shared() {
+		if c.FullName() == "main/libbar.so!decode" {
+			fmt.Printf("  %s kind=%s old=%.0f new=%.0f delta=%+.0f\n",
+				c.FullName(), c.Kind, c.OldTotal, c.NewTotal, c.DeltaTotal)
+		}
+	}
+	fmt.Println("\n采样占比同时变化（符号移动 + 样本变化，应标 sample）:")
+	cmp2 := perfsample.CompareMapped(treeResolved, build2, mapping)
+	fmt.Printf("%-46s %-9s %8s %8s %8s\n", "path", "kind", "oldTot", "newTot", "delta")
+	for _, c := range cmp2.Shared() {
+		fmt.Printf("%-46s %-9s %8.0f %8.0f %+8.0f\n",
+			c.FullName(), c.Kind, c.OldTotal, c.NewTotal, c.DeltaTotal)
+	}
+	if u := cmp2.Unmatched(); len(u) > 0 {
+		fmt.Println("未匹配路径:")
+		for _, c := range u {
+			side := "old-only"
+			if c.InNew {
+				side = "new-only"
+			}
+			fmt.Printf("  ? %-44s (%s)\n", c.FullName(), side)
 		}
 	}
 }

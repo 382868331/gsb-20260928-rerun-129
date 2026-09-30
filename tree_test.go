@@ -1,11 +1,6 @@
 package perfsample
 
-import (
-	"math"
-	"testing"
-)
-
-func approxEq(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+import "testing"
 
 // 一个可以直接手工统计的小样例。
 //

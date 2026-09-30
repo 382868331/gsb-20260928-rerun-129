@@ -17,6 +17,23 @@ type Node struct {
 
 	// HasMissing 表示本节点是否聚合过符号缺失的栈层。
 	HasMissing bool
+	// Module 为该节点帧所属模块；空表示未指定（与第一版样本兼容）。
+	Module string
+	// Symbol 为该节点帧的符号名（去掉模块/内联限定后的展示名）。
+	Symbol string
+	// InlineLevel 为该节点帧的内联层次，0 表示物理函数。
+	InlineLevel int
+
+	// keyPath 记录该节点相对虚拟根的完整键路径，仅供内部跨版本回退定位。
+	keyPath string
+
+	// through 记录经过本节点的每条样本（按 Sample.ID）贡献的包含权重；
+	// selfThrough 只记录采样点恰好落在本节点（叶子）的自身权重。
+	// 空 ID 的样本不登记，改由地址/名字回退。重新解释（补符号、
+	// 内联展开、函数移动）只改变样本落在哪些节点上，不改变样本本身，
+	// 因此可通过这些锚点核对权重守恒、跨版本对应路径。
+	through     map[string]float64
+	selfThrough map[string]float64
 
 	prov map[provKey]*provStat
 }
@@ -46,9 +63,11 @@ func NewTree() *Tree {
 
 func newNode(name string) *Node {
 	return &Node{
-		Name:     name,
-		Children: map[string]*Node{},
-		prov:     map[provKey]*provStat{},
+		Name:        name,
+		Children:    map[string]*Node{},
+		through:     map[string]float64{},
+		selfThrough: map[string]float64{},
+		prov:        map[provKey]*provStat{},
 	}
 }
 
@@ -74,19 +93,34 @@ func (t *Tree) AddSample(s Sample) {
 	cur.addProv(k, 0, w)
 
 	for i, f := range s.Stack {
+		isLeaf := i == len(s.Stack)-1
 		key := frameKey(f)
 		child := cur.Children[key]
 		if child == nil {
 			child = newNode(key)
+			if cur == t.Root {
+				child.keyPath = key
+			} else {
+				child.keyPath = cur.keyPath + pathSep + key
+			}
 			cur.Children[key] = child
 		}
 		if f.Missing || f.Symbol == "" {
 			child.HasMissing = true
+		} else {
+			child.Module = f.Module
+			child.InlineLevel = f.InlineLevel
+			child.Symbol = f.Symbol
 		}
 		child.TotalWeight += w
 		child.SampleCount++
+		if s.ID != "" {
+			child.through[s.ID] += w
+			if isLeaf {
+				child.selfThrough[s.ID] += w
+			}
+		}
 
-		isLeaf := i == len(s.Stack)-1
 		if isLeaf {
 			child.SelfWeight += w
 		}
@@ -163,4 +197,40 @@ func (n *Node) SortedChildren() []*Node {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// Anchors 返回经过本节点的样本 ID -> 权重 的拷贝。
+// 对于叶子节点，这些权重同时构成本节点的自身权重；对于内部节点，
+// 它们是经过该节点（包含子调用）的权重。
+// 重新解释前后同一组锚点的权重总和必须保持不变（权重守恒）。
+func (n *Node) Anchors() map[string]float64 {
+	out := make(map[string]float64, len(n.through))
+	for id, w := range n.through {
+		out[id] = w
+	}
+	return out
+}
+
+// LeafAnchors 返回采样点落在本节点的样本 ID -> 自身权重 的拷贝。
+// 每个带 ID 的样本在一棵树中恰好有一个叶子位置，因此叶子锚点可以
+// 在重新解释/跨版本对应中无歧义地回退定位。
+func (n *Node) LeafAnchors() map[string]float64 {
+	out := make(map[string]float64, len(n.selfThrough))
+	for id, w := range n.selfThrough {
+		out[id] = w
+	}
+	return out
+}
+
+// AnchorWeight 返回指定样本 ID 经过本节点的权重，不存在返回 0。
+func (n *Node) AnchorWeight(id string) float64 {
+	return n.through[id]
+}
+
+// DisplayName 返回适合展示的函数名（不含模块/内联限定）。
+func (n *Node) DisplayName() string {
+	if n.Symbol != "" {
+		return n.Symbol
+	}
+	return n.Name
 }

@@ -7,7 +7,8 @@
 ## 模型
 
 - `Frame`：栈的一层。`Stack[0]` 为最外层，最后一层为采样点。符号缺失时
-  置 `Missing=true` 并带原始 `Addr`。
+  置 `Missing=true` 并带原始 `Addr`。`Module` 区分同名函数所在模块，
+  `InlineLevel` 区分内联层次（0 为物理函数，>=1 为补回的内联帧）。
 - `Sample`：一条栈样本 + `Weight`（默认 1）+ `Provenance`。
 - `Provenance`：`Source`（采集来源）、`SymbolVersion`（符号版本）、
   `Batch`（批次）。合并后仍可在每个节点上按来源/版本拆分权重，因此新增
@@ -27,6 +28,40 @@
 - **两版对比**：`Compare` 按完整调用路径（而非函数名）对齐两次运行，
   `Shared()` 只返回两版都存在的路径及其权重差。
 
+## 符号补全与重新解释（第二版新增）
+
+拿到新符号资料后，用 `Reinterpret(samples, resolver)` 对**同一批原始样本**
+重新解释，再重新建树。解析器只能改解释，碰不到权重：
+
+- `Sample.ID/Weight/Provenance` 与样本数量、顺序完全不变；
+- 每个原始 `Addr` 保留在解释出的所有逻辑帧上（含内联展开的各层）；
+- 缺符号 -> 已解析、函数改名、一个物理帧展开成多个内联层，都只改变
+  样本落在哪些节点，**不新增也不丢失任何权重**；
+- 可用节点的 `Anchors()`/`LeafAnchors()`（样本 ID -> 权重）核对
+  自身权重与包含权重在重新解释前后守恒。
+
+身份键由 `(模块, 符号/地址, 内联层次)` 共同决定：同名函数在不同模块、
+递归 `f->f` 的不同层次、不同内联层都各自保留身份，不会互相折叠。
+未指定模块/内联层次的旧样本键退化为纯符号名，旧行为与旧报告完全兼容。
+
+## 跨构建版本路径对应
+
+`NewMapping(Move{...})` 描述函数在两个构建之间的改名/移动/内联变化，
+`CompareMapped(oldTree, newTree, mapping)` 按“先映射翻译路径、再用样本
+锚点唯一回退”的顺序对应：
+
+- 映射显式命中：旧路径翻译成新路径，即使名字/模块变了也能对上；
+- 路径对不上但带 ID 的叶子样本在新树唯一落到同一节点：锚点回退对应；
+- 缺符号占位无法翻译、锚点缺失或散落到多个节点：标为 `KindUnmatched`，
+  不产生虚假权重差，`Shared()` 也不会包含它。
+
+比较报告用 `PathChange.Kind` 说明差异来源：
+
+- `same`：路径对应且权重不变；
+- `symbol`：纯符号变化（改名/移动/补全），同一批样本同一组权重，delta 为 0；
+- `sample`：对应路径上样本权重真的变了（即使同时发生符号移动）；
+- `unmatched`：无法可靠对应，只能单列，不能凭空搬运权重。
+
 ## 用法
 
 ```go
@@ -43,6 +78,24 @@ cmp := perfsample.Compare(oldTree, newTree)
 for _, c := range cmp.Shared() {      // 相同路径上的变化
     fmt.Println(c.FullName(), c.DeltaTotal)
 }
+
+// 符号补全后重新解释：原始地址/权重不变，只改解释
+resolved := perfsample.Reinterpret(samples, perfsample.ResolverFunc(func(f perfsample.Frame) []perfsample.FrameInfo {
+    if f.Missing && f.Addr == 0x4010 {
+        return []perfsample.FrameInfo{{Module: "libfoo.so", Symbol: "decode"}}
+    }
+    return nil
+}))
+
+// 跨构建版本：函数从旧模块移动到新模块，按映射 + 样本锚点对应
+m := perfsample.NewMapping(perfsample.Move{
+    OldModule: "libfoo.so", OldSymbol: "decode",
+    NewModule: "libbar.so", NewSymbol: "decode",
+})
+c2 := perfsample.CompareMapped(oldTree, newTree, m)
+for _, c := range c2.Shared() {
+    fmt.Println(c.Kind, c.FullName(), c.DeltaTotal) // symbol / sample / unmatched
+}
 ```
 
 ## 验证与演示
@@ -53,4 +106,6 @@ go run ./cmd/perfdiff  # 仅使用内嵌人工样本，展示两版对比
 ```
 
 测试覆盖：递归两层不被折叠、自身权重之和等于根总权重、缺失符号保留、
-跨采集器合并批次的权重对账、两版同路径对比与新增路径识别。
+跨采集器合并批次的权重对账、两版同路径对比与新增路径识别；以及符号
+补全后的权重守恒、内联层次展开、同名函数按模块区分、跨版本函数移动、
+样本锚点回退、未匹配路径标注，和 symbol/sample 差异分类。
