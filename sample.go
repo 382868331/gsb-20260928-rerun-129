@@ -7,9 +7,15 @@ package perfsample
 // 当符号缺失时 Symbol 为空、Missing 为 true，分析器不会丢弃该样本，
 // 而是用地址生成一个稳定的占位名字。
 type Frame struct {
-	Symbol  string
-	Addr    uint64
-	Missing bool
+	// Module 是函数所属模块（共享库/目标文件等）。同名函数位于不同
+	// 模块时是不同身份，不能折叠。
+	Module string
+	// InlineDepth 标记内联展开层次：0 表示普通栈帧，>0 表示由同一
+	// 原始地址展开出的内联帧，从外向内递增。
+	InlineDepth int
+	Symbol      string
+	Addr        uint64
+	Missing     bool
 }
 
 // Provenance 记录样本的来源与符号版本，保证结果可追溯：
@@ -45,13 +51,45 @@ func (s Sample) weight() float64 {
 // 记录在节点的来源明细中）；缺失符号按地址区分，避免把不同的
 // 未知函数错误折叠。
 func frameKey(f Frame) string {
+	// 旧数据没有模块/内联信息，保留原键，保证旧树和旧调用仍可读取。
 	if f.Missing || f.Symbol == "" {
-		if f.Addr != 0 {
-			return unknownPrefix + addrHex(f.Addr) + ")"
+		if f.Module == "" && f.InlineDepth == 0 {
+			if f.Addr != 0 {
+				return unknownPrefix + addrHex(f.Addr) + ")"
+			}
+			return unknownName
 		}
-		return unknownName
+		return compositeKey("missing", f.Module, addrHex(f.Addr), f.InlineDepth)
 	}
-	return f.Symbol
+	if f.Module == "" && f.InlineDepth == 0 {
+		return f.Symbol
+	}
+	return compositeKey("symbol", f.Module, f.Symbol, f.InlineDepth)
+}
+
+func compositeKey(kind, module, name string, depth int) string {
+	return kind + "\x00" + module + "\x00" + name + "\x00" + addrHex(uint64(depth))
+}
+
+// FrameID 是跨构建版本对应调用路径时使用的函数身份。
+// 同名函数只要模块、内联层次或缺失地址不同，就是不同身份。
+type FrameID struct {
+	Module      string `json:"module,omitempty"`
+	Symbol      string `json:"symbol,omitempty"`
+	Addr        uint64 `json:"addr,omitempty"`
+	Missing     bool   `json:"missing,omitempty"`
+	InlineDepth int    `json:"inline_depth,omitempty"`
+}
+
+// Identity 返回该帧的稳定身份。
+func (f Frame) Identity() FrameID {
+	return FrameID{
+		Module:      f.Module,
+		Symbol:      f.Symbol,
+		Addr:        f.Addr,
+		Missing:     f.Missing || f.Symbol == "",
+		InlineDepth: f.InlineDepth,
+	}
 }
 
 const (

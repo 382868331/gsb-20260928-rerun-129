@@ -5,88 +5,231 @@ import (
 	"strings"
 )
 
-// PathChange 描述同一条调用路径在两次运行之间的权重变化。
+type MatchStatus int
+
+const (
+	// Matched 表示新旧路径可以可靠一一对应。
+	Matched MatchStatus = iota
+	// Unmatched 表示无法可靠对应。
+	Unmatched
+)
+
+func (s MatchStatus) String() string {
+	if s == Matched {
+		return "matched"
+	}
+	return "unmatched"
+}
+
 type PathChange struct {
-	Path       []string
-	OldSelf    float64
-	NewSelf    float64
-	NewTotal   float64
-	OldTotal   float64
-	DeltaSelf  float64
-	DeltaTotal float64
-	InOld      bool
-	InNew      bool
+	Path          []string    `json:"path"`
+	OldIDPath     []FrameID   `json:"old_id_path,omitempty"`
+	NewIDPath     []FrameID   `json:"new_id_path,omitempty"`
+	OldSelf       float64     `json:"old_self,omitempty"`
+	NewSelf       float64     `json:"new_self,omitempty"`
+	OldTotal      float64     `json:"old_total,omitempty"`
+	NewTotal      float64     `json:"new_total,omitempty"`
+	DeltaSelf     float64     `json:"delta_self"`
+	DeltaTotal    float64     `json:"delta_total"`
+	InOld         bool        `json:"in_old"`
+	InNew         bool        `json:"in_new"`
+	Status        MatchStatus `json:"status"`
+	SampleChanged bool        `json:"sample_changed,omitempty"`
+	SymbolChanged bool        `json:"symbol_changed,omitempty"`
 }
 
-// FullName 用 "/" 连接调用路径，便于展示。
 func (c PathChange) FullName() string { return strings.Join(c.Path, "/") }
+func (c PathChange) Matched() bool    { return c.Status == Matched }
 
-// Comparison 是两次运行在全部调用路径上的对比结果。
 type Comparison struct {
-	Changes []PathChange
+	Changes []PathChange `json:"changes"`
 }
 
-// Compare 对比两棵执行树（通常对应同一程序的两次运行/两个版本）。
-// 节点按完整调用路径对齐，而不是只按函数名对齐。
 func Compare(oldTree, newTree *Tree) *Comparison {
-	old := map[string]*Node{}
-	new := map[string]*Node{}
-	collect(oldTree.Root, nil, old)
-	collect(newTree.Root, nil, new)
+	return CompareBuilds(oldTree, newTree, nil)
+}
 
-	keys := map[string]bool{}
-	for k := range old {
-		keys[k] = true
-	}
-	for k := range new {
-		keys[k] = true
+// FrameMapping 声明一个函数帧在两个构建间的可靠对应关系。
+type FrameMapping struct {
+	From FrameID
+	To   FrameID
+}
+
+func CompareBuilds(oldTree, newTree *Tree, mappings []FrameMapping) *Comparison {
+	oldNodes := map[string]*nodeEntry{}
+	newNodes := map[string]*nodeEntry{}
+	collectID(oldTree.Root, nil, oldNodes)
+	collectID(newTree.Root, nil, newNodes)
+
+	forward := map[FrameID]FrameID{}
+	reverse := map[FrameID]FrameID{}
+	for _, m := range mappings {
+		if existing, conflict := forward[m.From]; conflict && existing != m.To {
+			continue
+		}
+		if existing, conflict := reverse[m.To]; conflict && existing != m.From {
+			continue
+		}
+		forward[m.From] = m.To
+		reverse[m.To] = m.From
 	}
 
-	changes := make([]PathChange, 0, len(keys))
-	for k := range keys {
-		if k == "" {
-			continue // 虚拟根不参与逐路径对比
+	matchedOld := map[string]string{}
+	matchedNew := map[string]string{}
+	for ok, oldEntry := range oldNodes {
+		nk := idPathKey(mapIDPath(oldEntry.idPath, forward))
+		if newNodes[nk] != nil {
+			matchedOld[ok] = nk
+			matchedNew[nk] = ok
 		}
-		path := strings.Split(k, pathSep)
-		c := PathChange{Path: path, InOld: old[k] != nil, InNew: new[k] != nil}
-		if o := old[k]; o != nil {
-			c.OldSelf, c.OldTotal = o.SelfWeight, o.TotalWeight
-		}
-		if n := new[k]; n != nil {
-			c.NewSelf, c.NewTotal = n.SelfWeight, n.TotalWeight
-		}
-		c.DeltaSelf = c.NewSelf - c.OldSelf
-		c.DeltaTotal = c.NewTotal - c.OldTotal
-		changes = append(changes, c)
 	}
-	sort.Slice(changes, func(i, j int) bool {
-		return changes[i].FullName() < changes[j].FullName()
-	})
+	for nk := range newNodes {
+		if oldNodes[nk] != nil {
+			matchedOld[nk] = nk
+			matchedNew[nk] = nk
+		}
+	}
+
+	seenNew := map[string]bool{}
+	changes := make([]PathChange, 0, len(oldNodes)+len(newNodes))
+	for ok, oldEntry := range oldNodes {
+		if newEntry := newNodes[matchedOld[ok]]; newEntry != nil {
+			seenNew[matchedOld[ok]] = true
+			changes = append(changes, matchedChange(oldEntry, newEntry))
+		} else {
+			changes = append(changes, unmatchedChange(oldEntry, nil, true))
+		}
+	}
+	for nk, newEntry := range newNodes {
+		if seenNew[nk] {
+			continue
+		}
+		if oldEntry := oldNodes[matchedNew[nk]]; oldEntry != nil {
+			changes = append(changes, matchedChange(oldEntry, newEntry))
+		} else {
+			changes = append(changes, unmatchedChange(nil, newEntry, false))
+		}
+	}
+
+	sort.Slice(changes, func(i, j int) bool { return changes[i].FullName() < changes[j].FullName() })
 	return &Comparison{Changes: changes}
+}
+
+type nodeEntry struct {
+	node   *Node
+	idPath []FrameID
+}
+
+func collectID(n *Node, ids []FrameID, out map[string]*nodeEntry) {
+	for _, c := range n.Children {
+		childIDs := append(append([]FrameID{}, ids...), c.ID)
+		out[idPathKey(childIDs)] = &nodeEntry{node: c, idPath: childIDs}
+		collectID(c, childIDs, out)
+	}
+}
+
+func idPathKey(ids []FrameID) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = frameIDKey(id)
+	}
+	return strings.Join(parts, pathSep)
+}
+
+func frameIDKey(id FrameID) string {
+	if id.Missing || id.Symbol == "" {
+		return "m" + pathSep + id.Module + pathSep + addrHex(id.Addr) + pathSep + addrHex(uint64(id.InlineDepth))
+	}
+	return "s" + pathSep + id.Module + pathSep + id.Symbol + pathSep + addrHex(uint64(id.InlineDepth))
+}
+
+func mapIDPath(ids []FrameID, m map[FrameID]FrameID) []FrameID {
+	out := make([]FrameID, len(ids))
+	for i, id := range ids {
+		if mapped, ok := m[id]; ok {
+			out[i] = mapped
+		} else {
+			out[i] = id
+		}
+	}
+	return out
+}
+
+func displayPath(ids []FrameID) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		if id.Missing || id.Symbol == "" {
+			if id.Addr != 0 {
+				out[i] = unknownPrefix + addrHex(id.Addr) + ")"
+			} else {
+				out[i] = unknownName
+			}
+		} else {
+			out[i] = id.Symbol
+		}
+	}
+	return out
+}
+
+func matchedChange(oldEntry, newEntry *nodeEntry) PathChange {
+	oldNode, newNode := oldEntry.node, newEntry.node
+	c := PathChange{
+		OldIDPath: append([]FrameID{}, oldEntry.idPath...),
+		NewIDPath: append([]FrameID{}, newEntry.idPath...),
+		OldSelf:   oldNode.SelfWeight,
+		NewSelf:   newNode.SelfWeight,
+		OldTotal:  oldNode.TotalWeight,
+		NewTotal:  newNode.TotalWeight,
+		InOld:     true,
+		InNew:     true,
+		Status:    Matched,
+	}
+	c.DeltaSelf = c.NewSelf - c.OldSelf
+	c.DeltaTotal = c.NewTotal - c.OldTotal
+	c.SampleChanged = absFloat(c.DeltaSelf) > 1e-9 || absFloat(c.DeltaTotal) > 1e-9
+	c.SymbolChanged = idPathKey(c.OldIDPath) != idPathKey(c.NewIDPath)
+	c.Path = displayPath(newEntry.idPath)
+	return c
+}
+
+func unmatchedChange(oldEntry, newEntry *nodeEntry, inOld bool) PathChange {
+	c := PathChange{Status: Unmatched, InOld: inOld, InNew: !inOld}
+	if inOld {
+		c.Path = displayPath(oldEntry.idPath)
+		c.OldIDPath = append([]FrameID{}, oldEntry.idPath...)
+		c.OldSelf, c.OldTotal = oldEntry.node.SelfWeight, oldEntry.node.TotalWeight
+		c.DeltaSelf, c.DeltaTotal = -c.OldSelf, -c.OldTotal
+	} else {
+		c.Path = displayPath(newEntry.idPath)
+		c.NewIDPath = append([]FrameID{}, newEntry.idPath...)
+		c.NewSelf, c.NewTotal = newEntry.node.SelfWeight, newEntry.node.TotalWeight
+		c.DeltaSelf, c.DeltaTotal = c.NewSelf, c.NewTotal
+	}
+	return c
 }
 
 const pathSep = "\x00"
 
-func collect(n *Node, prefix []string, out map[string]*Node) {
-	for _, c := range n.Children {
-		path := append(append([]string{}, prefix...), c.Name)
-		out[strings.Join(path, pathSep)] = c
-		collect(c, path, out)
-	}
-}
-
-// Shared 只返回两次运行都存在的相同调用路径上的变化。
 func (cmp *Comparison) Shared() []PathChange {
-	var out []PathChange
+	out := []PathChange{}
 	for _, c := range cmp.Changes {
-		if c.InOld && c.InNew {
+		if c.Status == Matched {
 			out = append(out, c)
 		}
 	}
 	return out
 }
 
-// TopChanges 返回包含权重变化绝对值最大的 n 条路径。
+func (cmp *Comparison) Unmatched() []PathChange {
+	out := []PathChange{}
+	for _, c := range cmp.Changes {
+		if c.Status == Unmatched {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func (cmp *Comparison) TopChanges(n int) []PathChange {
 	all := make([]PathChange, len(cmp.Changes))
 	copy(all, cmp.Changes)
@@ -106,7 +249,6 @@ func absFloat(x float64) float64 {
 	return x
 }
 
-// WeightReport 是合并批次后的权重对账结果。
 type WeightReport struct {
 	TreeTotal  float64
 	GivenTotal float64
@@ -115,14 +257,8 @@ type WeightReport struct {
 	Balanced   bool
 }
 
-// Reconcile 校验树中计入的总权重/样本数是否与各批次声明的一致。
 func Reconcile(t *Tree, givenWeight float64, givenCount int64) WeightReport {
-	r := WeightReport{
-		TreeTotal:  t.Root.TotalWeight,
-		GivenTotal: givenWeight,
-		TreeCount:  t.Root.SampleCount,
-		GivenCount: givenCount,
-	}
+	r := WeightReport{TreeTotal: t.Root.TotalWeight, GivenTotal: givenWeight, TreeCount: t.Root.SampleCount, GivenCount: givenCount}
 	r.Balanced = r.TreeCount == r.GivenCount && absFloat(r.TreeTotal-r.GivenTotal) < 1e-9
 	return r
 }

@@ -16,7 +16,7 @@ func (t *Tree) String() string {
 
 func walkPrint(b *strings.Builder, n *Node, indent string) {
 	for _, c := range n.SortedChildren() {
-		name := c.Name
+		name := c.DisplayName()
 		if c.HasMissing {
 			name += " [missing-symbol]"
 		}

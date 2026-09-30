@@ -22,6 +22,16 @@
   各自分别统计自身/包含权重。
 - **缺失符号不丢样本**：缺失帧按地址归并为 `(unknown@0x<addr>)`，
   并标记 `HasMissing`；该样本的权重照常计入。
+- **符号只改解释不改权重**：树保留原始样本，`Reinterpret` 用补全后的
+  符号资料从原始地址重建。一个地址可展开成内联帧链，但样本 ID、地址、
+  权重和来源不变，自身权重之和仍等于根总权重。
+- **同名函数保留身份**：函数身份由模块、符号名、内联层次和缺失地址共同
+  决定。不同模块的同名函数分别聚合；递归仍由调用路径中的层次区分。
+- **构建间可靠对应**：`CompareBuilds` 只自动对应身份完全相同的路径，
+  函数移动可通过 `FrameMapping` 显式声明；无法可靠对应的路径标为
+  `Unmatched`，不会凭空解释为权重增减。
+- **报告区分变化来源**：匹配路径用 `SampleChanged`/`SymbolChanged` 区分
+  样本权重变化和符号解释变化。`UnmarshalReport` 可读取旧版报告。
 - **批次对账**：虚拟根的 `TotalWeight/SampleCount` 等于全部已合并样本的
   权重/数量，可用 `Reconcile` 与各批次声明值核对。
 - **两版对比**：`Compare` 按完整调用路径（而非函数名）对齐两次运行，
@@ -43,6 +53,23 @@ cmp := perfsample.Compare(oldTree, newTree)
 for _, c := range cmp.Shared() {      // 相同路径上的变化
     fmt.Println(c.FullName(), c.DeltaTotal)
 }
+
+resolved := tree.Reinterpret(func(f perfsample.Frame) []perfsample.Frame {
+	if f.Missing && f.Addr == 0x4010 {
+		return []perfsample.Frame{
+			{Module: "app", Symbol: "outer", Addr: f.Addr, InlineDepth: 1},
+			{Module: "app", Symbol: "inner", Addr: f.Addr, InlineDepth: 2},
+		}
+	}
+	return nil
+})
+
+mapped := perfsample.CompareBuilds(oldTree, newTree, []perfsample.FrameMapping{{
+	From: perfsample.FrameID{Module: "old", Symbol: "work"},
+	To:   perfsample.FrameID{Module: "new", Symbol: "workV2"},
+}})
+_ = resolved
+_ = mapped
 ```
 
 ## 验证与演示
@@ -53,4 +80,5 @@ go run ./cmd/perfdiff  # 仅使用内嵌人工样本，展示两版对比
 ```
 
 测试覆盖：递归两层不被折叠、自身权重之和等于根总权重、缺失符号保留、
-跨采集器合并批次的权重对账、两版同路径对比与新增路径识别。
+符号补全/内联展开后的权重不变、不同模块同名函数身份分离、函数移动映射、
+不可靠路径未匹配、旧报告读取，以及跨采集器批次对账。

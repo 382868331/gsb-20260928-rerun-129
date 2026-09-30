@@ -64,6 +64,49 @@ func main() {
 			fmt.Printf("  + %s total=%.0f\n", c.FullName(), c.NewTotal)
 		}
 	}
+
+	fmt.Println("\n=== 符号资料补全后重新解释（地址和权重不变）===")
+	resolved := treeV1.Reinterpret(func(f perfsample.Frame) []perfsample.Frame {
+		if f.Missing && f.Addr == 0x4010 {
+			return []perfsample.Frame{
+				{Module: "app", Symbol: "serialize", Addr: f.Addr, InlineDepth: 1},
+				{Module: "app", Symbol: "writeFast", Addr: f.Addr, InlineDepth: 2},
+			}
+		}
+		return nil
+	})
+	if resolved.Root.TotalWeight != treeV1.Root.TotalWeight || resolved.Root.SampleCount != treeV1.Root.SampleCount {
+		panic("symbol reinterpretation changed sample weights")
+	}
+	inner := resolved.FindID(
+		perfsample.FrameID{Symbol: "main"},
+		perfsample.FrameID{Symbol: "serve"},
+		perfsample.FrameID{Symbol: "handle"},
+		perfsample.FrameID{Module: "app", Symbol: "serialize", Addr: 0x4010, InlineDepth: 1},
+		perfsample.FrameID{Module: "app", Symbol: "writeFast", Addr: 0x4010, InlineDepth: 2},
+	)
+	if inner == nil {
+		panic("resolved inline path not found")
+	}
+	fmt.Printf("main/serve/handle/serialize/writeFast self=%.0f total=%.0f addr=0x%x\n",
+		inner.SelfWeight, inner.TotalWeight, inner.ID.Addr)
+
+	fmt.Println("\n=== 显式函数移动映射（符号变化但样本权重不变）===")
+	oldFunc := perfsample.NewTree()
+	oldFunc.AddSample(perfsample.Sample{Weight: 5, Stack: []perfsample.Frame{{Module: "oldlib", Symbol: "work"}}})
+	newFunc := perfsample.NewTree()
+	newFunc.AddSample(perfsample.Sample{Weight: 5, Stack: []perfsample.Frame{{Module: "newlib", Symbol: "workV2"}}})
+	mapped := perfsample.CompareBuilds(oldFunc, newFunc, []perfsample.FrameMapping{{
+		From: perfsample.FrameID{Module: "oldlib", Symbol: "work"},
+		To:   perfsample.FrameID{Module: "newlib", Symbol: "workV2"},
+	}})
+	for _, c := range mapped.Shared() {
+		kind := "sample"
+		if c.SymbolChanged && !c.SampleChanged {
+			kind = "symbol"
+		}
+		fmt.Printf("%s: old=%.0f new=%.0f delta=%+.0f change=%s\n", c.FullName(), c.OldTotal, c.NewTotal, c.DeltaTotal, kind)
+	}
 }
 
 func stack(weight float64, source, ver, batch string, syms ...string) perfsample.Sample {
