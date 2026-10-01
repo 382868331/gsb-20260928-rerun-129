@@ -19,6 +19,8 @@ type Node struct {
 	HasMissing bool
 	// Module 为该节点帧所属模块；空表示未指定（与第一版样本兼容）。
 	Module string
+	// BuildID 为该节点帧所属模块构建，用于区分卸载后重新装载的版本。
+	BuildID string
 	// Symbol 为该节点帧的符号名（去掉模块/内联限定后的展示名）。
 	Symbol string
 	// InlineLevel 为该节点帧的内联层次，0 表示物理函数。
@@ -94,7 +96,9 @@ func (t *Tree) AddSample(s Sample) {
 
 	for i, f := range s.Stack {
 		isLeaf := i == len(s.Stack)-1
-		key := frameKey(f)
+		keyFrame := f
+		keyFrame.observedAt = s.Time
+		key := frameKey(keyFrame)
 		child := cur.Children[key]
 		if child == nil {
 			child = newNode(key)
@@ -105,11 +109,12 @@ func (t *Tree) AddSample(s Sample) {
 			}
 			cur.Children[key] = child
 		}
+		child.Module = f.Module
+		child.BuildID = f.BuildID
+		child.InlineLevel = f.InlineLevel
 		if f.Missing || f.Symbol == "" {
 			child.HasMissing = true
 		} else {
-			child.Module = f.Module
-			child.InlineLevel = f.InlineLevel
 			child.Symbol = f.Symbol
 		}
 		child.TotalWeight += w

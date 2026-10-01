@@ -78,15 +78,25 @@ func DisplayKey(key string) string {
 		module = rest[:i]
 		rest = rest[i+len(moduleSep):]
 	}
+	build := ""
+	if i := strings.Index(rest, buildSep); i >= 0 {
+		build = "#" + rest[i+len(buildSep):]
+		rest = rest[:i]
+	}
 	inline := ""
 	if i := strings.Index(rest, inlineSep); i >= 0 {
 		inline = "[i" + rest[i+len(inlineSep):] + "]"
 		rest = rest[:i]
 	}
-	if module != "" {
-		return module + "!" + rest + inline
+	time := ""
+	if i := strings.Index(rest, timeSep); i >= 0 {
+		time = "[t" + rest[i+len(timeSep):] + "]"
+		rest = rest[:i]
 	}
-	return rest + inline
+	if module != "" {
+		return module + build + "!" + rest + inline
+	}
+	return rest + time + inline
 }
 
 // Comparison 是两次运行在全部调用路径上的对比结果。

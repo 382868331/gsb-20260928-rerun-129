@@ -5,10 +5,29 @@ package perfsample
 // 解释成多个逻辑帧。
 type FrameInfo struct {
 	Module      string
+	BuildID     string
 	Symbol      string
 	InlineLevel int
 	// Missing 为 true 时表示该地址仍无法解析，Symbol 可留空。
 	Missing bool
+	// Uncertain 为 true 时表示归属仍无法唯一确认；该帧按原地址保留，
+	// 不参与跨版本折叠。
+	Uncertain bool
+}
+
+// ResolveContext 携带解析一帧时所需的采样上下文。
+// Time 是该样本的采集时刻，解析器据此查询模块装载/卸载关系。
+type ResolveContext struct {
+	Time     uint64
+	SampleID string
+	FrameIdx int
+}
+
+// ContextSymbolResolver 在 SymbolResolver 的基础上提供采样时刻，
+// 使解析器能够按当时的模块关系解释地址。Reinterpret 会优先使用
+// 该接口；只实现 SymbolResolver 的旧解析器仍然完全兼容。
+type ContextSymbolResolver interface {
+	ResolveFrame(ctx ResolveContext, f Frame) []FrameInfo
 }
 
 // SymbolResolver 按当前符号资料解释一个原始帧。
@@ -46,10 +65,21 @@ func Reinterpret(samples []Sample, resolver SymbolResolver) []Sample {
 		rs := s
 		if len(s.Stack) > 0 {
 			rs.Stack = make([]Frame, 0, len(s.Stack))
-			for _, f := range s.Stack {
-				infos := resolver.Resolve(f)
+			for fi, f := range s.Stack {
+				var infos []FrameInfo
+				if cr, ok := resolver.(ContextSymbolResolver); ok {
+					infos = cr.ResolveFrame(ResolveContext{
+						Time:     s.Time,
+						SampleID: s.ID,
+						FrameIdx: fi,
+					}, f)
+				} else {
+					infos = resolver.Resolve(f)
+				}
 				if len(infos) == 0 {
-					rs.Stack = append(rs.Stack, f)
+					kept := f
+					kept.observedAt = s.Time
+					rs.Stack = append(rs.Stack, kept)
 					continue
 				}
 				for _, info := range infos {
@@ -57,8 +87,11 @@ func Reinterpret(samples []Sample, resolver SymbolResolver) []Sample {
 						Symbol:      info.Symbol,
 						Addr:        f.Addr, // 原始地址始终保留
 						Missing:     info.Missing,
+						Uncertain:   info.Uncertain,
 						Module:      info.Module,
+						BuildID:     info.BuildID,
 						InlineLevel: info.InlineLevel,
+						observedAt:  s.Time,
 					})
 				}
 			}

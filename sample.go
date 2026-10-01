@@ -10,10 +10,21 @@ type Frame struct {
 	Symbol  string
 	Addr    uint64
 	Missing bool
+	// Uncertain 为 true 时表示：结合采样时刻的模块装载关系后，
+	// 该地址的归属仍无法唯一确认（例如采样时刻没有任何已登记模块
+	// 覆盖该地址，或同一时刻有多个模块声称占有该地址）。
+	// 这样的帧按原地址单独保留，绝不与其它版本同地址的函数折叠，
+	// 也不会被丢弃。
+	Uncertain bool
+	// observedAt 内部记录采样时刻，仅用于让归属存疑帧在不同时刻分开。
+	observedAt uint64
 	// Module 是该帧所属模块（共享库/二进制）名。同名函数在不同模块中
 	// 是不同身份，不会因为 Symbol 相同而被折叠。空字符串表示未指定模块，
 	// 此时行为与第一版一致（只按符号名归并）。
 	Module string
+	// BuildID 区分同一模块在采样期间卸载/重新装载后的不同构建。
+	// 空表示未指定，身份退化为仅按 Module 归并。
+	BuildID string
 	// InlineLevel 描述内联层次：0 表示有真实栈帧的物理函数，
 	// >=1 表示符号资料补全后还原出的内联函数（1 为最靠近物理帧的一层，
 	// 数字越大越靠近调用方）。不同内联层次是不同身份，递归 f->f
@@ -40,6 +51,12 @@ type Sample struct {
 	Stack  []Frame
 	Weight float64
 	Prov   Provenance
+	// Time 是该样本被采集到的时刻（单位由调用方约定，建议纳秒）。
+	// 重新解释时按这个时刻查模块装载/卸载关系：同一个地址在不同
+	// 时刻可能属于不同模块，绝不允许只按地址跨时间折叠。
+	// 零值表示调用方不提供时刻，此时时间感知解析器退化为
+	// “任意时刻均可命中”的开放式匹配。
+	Time uint64
 }
 
 func (s Sample) weight() float64 {
@@ -60,11 +77,21 @@ func (s Sample) weight() float64 {
 func frameKey(f Frame) string {
 	if f.Missing || f.Symbol == "" {
 		if f.Addr != 0 {
-			return frameIdentity(f.Module, unknownPrefix+addrHex(f.Addr)+")", f.InlineLevel)
+			name := unknownPrefix + addrHex(f.Addr) + ")"
+			if f.Uncertain {
+				// 归属存疑的帧不与“确定的未知函数”折叠，也不与
+				// 另一版本同地址的代码折叠。
+				name += uncertainSuffix + timeSep + itoa64(f.observedAt)
+			}
+			return frameIdentity(moduleIdentity(f.Module, f.BuildID), name, f.InlineLevel)
 		}
-		return frameIdentity(f.Module, unknownName, f.InlineLevel)
+		name := unknownName
+		if f.Uncertain {
+			name += uncertainSuffix + timeSep + itoa64(f.observedAt)
+		}
+		return frameIdentity(moduleIdentity(f.Module, f.BuildID), name, f.InlineLevel)
 	}
-	return frameIdentity(f.Module, f.Symbol, f.InlineLevel)
+	return frameIdentity(moduleIdentity(f.Module, f.BuildID), f.Symbol, f.InlineLevel)
 }
 
 // frameIdentity 用与 pathSep 不同的分隔符拼出稳定的帧身份键。
@@ -84,11 +111,16 @@ func frameIdentity(module, symbol string, inlineLevel int) string {
 }
 
 const (
-	unknownName   = "(unknown)"
-	unknownPrefix = "(unknown@0x"
-	moduleSep     = "\x01:"
-	inlineSep     = "\x01i"
+	unknownName     = "(unknown)"
+	unknownPrefix   = "(unknown@0x"
+	uncertainSuffix = "?unowned"
+	moduleSep       = "\x01:"
+	buildSep        = "\x01#"
+	inlineSep       = "\x01i"
+	timeSep         = "\x01t"
 )
+
+func itoa64(n uint64) string { return itoa(int(n)) }
 
 func itoa(n int) string {
 	if n == 0 {

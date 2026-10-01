@@ -168,6 +168,46 @@ func demoReinterpretAndMapping() {
 			fmt.Printf("  ? %-44s (%s)\n", c.FullName(), side)
 		}
 	}
+	demoTimedReloadAndUndo()
+}
+
+// demoTimedReloadAndUndo 演示同一地址在模块卸载/重新装载后属于不同代码：
+// 重新解释按采样时刻命中对应构建；归属空档保留为存疑样本；两份资料
+// 的差异按 rename/weight/uncertain 汇总；用户可以撤回一次新解释。
+func demoTimedReloadAndUndo() {
+	fmt.Println("\n=== 模块卸载后重新装载：同地址不同代码按采样时刻归属 ===")
+	history := perfsample.NewModuleHistory(
+		perfsample.ModuleSpan{Module: "plugin.so", BuildID: "v1", Base: 0x1000, End: 0x2000, UnloadAt: 100},
+		perfsample.ModuleSpan{Module: "plugin.so", BuildID: "v2", Base: 0x1000, End: 0x2000, LoadAt: 100},
+	)
+	profile := perfsample.NewSymbolProfile(
+		perfsample.ModuleSymbols{Module: "plugin.so", BuildID: "v1",
+			Funcs: []perfsample.FuncSym{{Name: "alpha", Start: 0x10, End: 0x20}}},
+		perfsample.ModuleSymbols{Module: "plugin.so", BuildID: "v2",
+			Funcs: []perfsample.FuncSym{{Name: "beta", Start: 0x10, End: 0x20}}},
+	)
+	raw := []perfsample.Sample{
+		{ID: "a", Weight: 3, Time: 50, Stack: []perfsample.Frame{{Missing: true, Addr: 0x1010}}},
+		{ID: "b", Weight: 4, Time: 150, Stack: []perfsample.Frame{{Missing: true, Addr: 0x1010}}},
+	}
+	session := perfsample.NewSession(raw)
+	session.Reinterpret(perfsample.NewTimedResolver(history, profile))
+	fmt.Print(session.Tree())
+
+	oldView := perfsample.Reinterpret(raw, perfsample.ResolverFunc(func(f perfsample.Frame) []perfsample.FrameInfo {
+		if f.Addr == 0x1010 {
+			return []perfsample.FrameInfo{{Module: "plugin.so", BuildID: "v1", Symbol: "alpha"}}
+		}
+		return nil
+	}))
+	newView := session.Samples()
+	diff := perfsample.CompareInterpretations(oldView, newView)
+	for _, s := range diff.Summarize() {
+		fmt.Printf("diff kind=%-11s count=%d old=%.0f new=%.0f\n", s.Kind, s.Count, s.OldWeight, s.NewWeight)
+	}
+	session.Undo()
+	fmt.Printf("撤回后总权重=%.0f，原始地址仍为 0x%x\n",
+		session.Tree().Root.TotalWeight, session.Samples()[0].Stack[0].Addr)
 }
 
 func stack(weight float64, source, ver, batch string, syms ...string) perfsample.Sample {

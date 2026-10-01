@@ -20,8 +20,12 @@ func walkPrint(b *strings.Builder, n *Node, indent string) {
 		if c.InlineLevel > 0 {
 			name += fmt.Sprintf(" [inline:%d]", c.InlineLevel)
 		}
-		if c.Module != "" {
-			name += fmt.Sprintf(" (%s)", c.Module)
+		module := c.Module
+		if c.BuildID != "" {
+			module += fmt.Sprintf("#%s", c.BuildID)
+		}
+		if module != "" {
+			name += fmt.Sprintf(" (%s)", module)
 		}
 		if c.HasMissing {
 			name += " [missing-symbol]"

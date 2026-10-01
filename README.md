@@ -62,6 +62,37 @@
 - `sample`：对应路径上样本权重真的变了（即使同时发生符号移动）；
 - `unmatched`：无法可靠对应，只能单列，不能凭空搬运权重。
 
+## 模块重装载、时间化归属与撤回（第三版新增）
+
+采样期间一个模块可能被卸载后重新装载，甚至重定位到不同地址。
+同一地址在不同时间可以属于完全不同的代码，因此重新解释必须结合
+`Sample.Time` 和当时的模块关系：
+
+- `ModuleSpan` 描述一次装载的模块、构建 ID、地址区间与 `[LoadAt, UnloadAt)`；
+- `ModuleHistory` 登记多次装载，`OwnersAt(addr, time)` 按时刻查归属；
+- `NewSymbolProfile(...)` 提供各“模块 + 构建”的函数/内联符号；
+- `NewTimedResolver(history, profile)` 实现时间感知解析：
+  唯一命中时解析到该次装载的构建；零个或多个命中时保留原地址并标记
+  存疑，绝不按地址把两个版本混成一个函数；
+- `Frame.Addr` 与 `Sample.Time` 始终保留；内联展开的每个逻辑帧也携带原地址。
+
+两份符号资料的差异用 `CompareInterpretations` / `CompareSymbolData` 比较，
+每条样本恰好出现一次，差异分为：
+
+- `same`：归属与权重均未变；
+- `rename`：原始地址、时刻、模块构建相同，只是名称或内联关系修订；
+- `weight`：对应同一份归属，但采样权重真的变化；
+- `attribution`：权重归属到不同代码位置（含重定位/符号边界变化）；
+- `uncertain`：至少一侧的归属仍无法确认；
+- `only-old` / `only-new`：另一侧没有对应样本。
+
+`SymbolDataDiff.OldTotal/NewTotal` 与 `Summarize()` 包含未匹配和存疑样本；
+调用方不能只看匹配项来美化占比。模块重定位与内联关系改变同时发生时，
+样本权重仍随样本完整迁移，树根总权重严格守恒。
+
+`Session` 保存一层重新解释历史：`Reinterpret` 后可用 `Undo()` 撤回一次，
+恢复旧符号视角；原始地址和时刻不会丢失。
+
 ## 用法
 
 ```go
@@ -96,6 +127,20 @@ c2 := perfsample.CompareMapped(oldTree, newTree, m)
 for _, c := range c2.Shared() {
     fmt.Println(c.Kind, c.FullName(), c.DeltaTotal) // symbol / sample / unmatched
 }
+
+// 采样期间模块重装载：按地址 + 时刻找到当时的模块/构建。
+history := perfsample.NewModuleHistory(
+    perfsample.ModuleSpan{Module: "plugin.so", BuildID: "v1", Base: 0x1000, End: 0x2000, UnloadAt: 100},
+    perfsample.ModuleSpan{Module: "plugin.so", BuildID: "v2", Base: 0x1000, End: 0x2000, LoadAt: 100},
+)
+profile := perfsample.NewSymbolProfile(
+    perfsample.ModuleSymbols{Module: "plugin.so", BuildID: "v1", Funcs: []perfsample.FuncSym{{Name: "alpha", Start: 0x10, End: 0x20}}},
+    perfsample.ModuleSymbols{Module: "plugin.so", BuildID: "v2", Funcs: []perfsample.FuncSym{{Name: "beta", Start: 0x10, End: 0x20}}},
+)
+session := perfsample.NewSession(raw) // raw 中每条 Sample 带 Time
+session.Reinterpret(perfsample.NewTimedResolver(history, profile))
+diff := perfsample.CompareInterpretations(oldView, session.Samples())
+session.Undo() // 撤回一次，恢复旧视角
 ```
 
 ## 验证与演示
