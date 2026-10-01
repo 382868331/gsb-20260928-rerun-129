@@ -67,6 +67,100 @@ func main() {
 	}
 
 	demoReinterpretAndMapping()
+	demoReloadDiffAndUndo()
+}
+
+// demoReloadDiffAndUndo 演示第三版能力：
+//  1. 进程在采样期间卸载并重新加载模块，同地址不同时刻属于不同代码，
+//     重新解释结合采样时刻与装载代次，不按地址混为一个函数；
+//  2. 两份符号资料差异比较，区分采样权重变化、名称修订、归属存疑，
+//     未匹配样本不丢弃，两侧权重对得上账；
+//  3. 撤回一次重新解释，恢复旧视角。
+func demoReloadDiffAndUndo() {
+	fmt.Println("\n=== 模块卸载/重载：相同地址在不同时刻属于不同代码 ===")
+	history := perfsample.NewModuleHistory(
+		perfsample.ModuleSpan{Module: "libv1.so", Base: 0x1000, Limit: 0x2000, Start: 0, End: 100, Generation: 1},
+		perfsample.ModuleSpan{Module: "libv2.so", Base: 0x1000, Limit: 0x2000, Start: 100, End: 0, Generation: 2},
+	)
+	samples := []perfsample.Sample{
+		{ID: "a", Weight: 3, Time: 50, Stack: []perfsample.Frame{
+			{Symbol: "main"}, {Missing: true, Addr: 0x1010},
+		}},
+		{ID: "b", Weight: 4, Time: 150, Stack: []perfsample.Frame{
+			{Symbol: "main"}, {Missing: true, Addr: 0x1010},
+		}},
+	}
+	sess := perfsample.NewSession(samples, "raw-addresses")
+	fmt.Print(sess.Current().Tree)
+
+	sess.Apply(perfsample.Reinterpretation{
+		Label:   "symbols-time-aware",
+		History: history,
+		Timed: perfsample.TimedResolverFunc(func(f perfsample.Frame, ts uint64, span perfsample.ModuleSpan) []perfsample.FrameInfo {
+			switch span.Generation {
+			case 1:
+				return []perfsample.FrameInfo{{Symbol: "oldfn"}}
+			case 2:
+				return []perfsample.FrameInfo{{Symbol: "newfn"}}
+			}
+			return nil
+		}),
+	})
+	fmt.Println("按采样时刻的装载关系重新解释后：")
+	fmt.Print(sess.Current().Tree)
+
+	// 两份符号资料差异：a 样本仅改名（权重不变），b 样本权重在新采集里变化，
+	// 另有 c 样本两版都缺符号，归属存疑但不丢弃。
+	oldSamples := []perfsample.Sample{
+		{ID: "a", Weight: 3, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1010}}},
+		{ID: "b", Weight: 2, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1020}}},
+		{ID: "c", Weight: 5, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1030}}},
+	}
+	newSamples := []perfsample.Sample{
+		{ID: "a", Weight: 3, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1010}}},
+		{ID: "b", Weight: 6, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1020}}},
+		{ID: "c", Weight: 5, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1030}}},
+	}
+	oldTree := reinterpretTree(oldSamples, func(f perfsample.Frame) []perfsample.FrameInfo {
+		switch f.Addr {
+		case 0x1010:
+			return []perfsample.FrameInfo{{Module: "libv1.so", Symbol: "oldfn"}}
+		case 0x1020:
+			return []perfsample.FrameInfo{{Module: "libx.so", Symbol: "work"}}
+		}
+		return nil
+	})
+	newTree := reinterpretTree(newSamples, func(f perfsample.Frame) []perfsample.FrameInfo {
+		switch f.Addr {
+		case 0x1010:
+			return []perfsample.FrameInfo{{Module: "libv2.so", Symbol: "newfn"}}
+		case 0x1020:
+			return []perfsample.FrameInfo{{Module: "libx.so", Symbol: "work"}}
+		}
+		return nil
+	})
+	mapping := perfsample.NewMapping(perfsample.Move{
+		OldModule: "libv1.so", OldSymbol: "oldfn",
+		NewModule: "libv2.so", NewSymbol: "newfn",
+	})
+	diff := perfsample.DiffProfiles(oldTree, newTree, mapping)
+	fmt.Println("两份符号资料差异（未匹配样本不丢弃）：")
+	fmt.Printf("  旧总权重 %.0f = 名称修订 %.0f + 采样变化 %.0f + 归属存疑 %.0f\n",
+		diff.OldTotal, diff.OldSymbolWeight, diff.OldSampleWeight, diff.OldUncertainWeight)
+	fmt.Printf("  新总权重 %.0f = 名称修订 %.0f + 采样变化 %.0f + 归属存疑 %.0f balanced=%v\n",
+		diff.NewTotal, diff.NewSymbolWeight, diff.NewSampleWeight, diff.NewUncertainWeight, diff.Balanced)
+
+	fmt.Println("\n撤回一次重新解释，恢复旧视角：")
+	if sess.Undo() {
+		fmt.Print(sess.Current().Tree)
+	}
+}
+
+func reinterpretTree(samples []perfsample.Sample, fn func(perfsample.Frame) []perfsample.FrameInfo) *perfsample.Tree {
+	re := perfsample.Reinterpret(samples, perfsample.ResolverFunc(fn))
+	t := perfsample.NewTree()
+	t.AddBatch(re)
+	return t
 }
 
 // demoReinterpretAndMapping 用第二组人工样本演示符号补全、内联展开、

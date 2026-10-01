@@ -62,6 +62,38 @@
 - `sample`：对应路径上样本权重真的变了（即使同时发生符号移动）；
 - `unmatched`：无法可靠对应，只能单列，不能凭空搬运权重。
 
+## 采样期间的模块装载/卸载/重载（第三版新增）
+
+一个进程在采样期间可能加载、卸载并在同一地址重新加载模块，相同地址在
+不同时间可能属于不同代码。样本新增 `Time`（采样时刻），帧新增
+`Generation`（模块装载代次）。`NewModuleHistory(ModuleSpan{...})` 描述
+模块在 `[Start,End)` 内占据的地址区间，`ReinterpretTimed` 解释时先按
+`(地址, 时刻)` 查“采样当时”的装载关系，再交给时间感知解析器：
+
+- 身份键是 `(模块, 装载代次, 符号/地址, 内联层次)`：同地址不同代次的
+  代码是两个独立节点，不会只按地址混成一个函数；
+- 同一时刻多个区间重叠声称拥有该地址、或无时刻样本的地址在历史上落入
+  多个区间时，归属被判定为有歧义，不强行归属；
+- 原始 `Addr` 与 `Time` 在所有解释帧上原样保留，样本数量、顺序、
+  `Weight/Provenance` 不变，内联展开与模块重定位同时发生时总权重仍守恒。
+
+## 两份符号资料的差异比较与撤回
+
+`DiffProfiles(oldTree, newTree, mapping)` 比较**同一批样本**在两份符号
+资料下的两棵树，在叶子（采样点）粒度按样本 ID 锚点归类，三种类别并列：
+
+- `symbol`：纯名称/模块/内联归属修订，两侧权重相等，delta 为 0；
+- `sample`：对应路径上采样权重真的变化（含仅一侧出现的样本）；
+- `uncertain`：两版都保留了权重，但归属对应仍无法确认（缺符号占位、
+  锚点散落等），两侧权重各自单列、delta 置 0，**绝不靠丢弃未匹配样本
+  美化占比**。报告的 `Old/NewSymbol/Sample/UncertainWeight` 之和必须等于
+  `OldTotal/NewTotal`，`Balanced` 为 false 即说明归类漏记。
+
+`NewSession(raw, label)` 管理解释视角：`Apply(Reinterpretation{...})`
+用新资料（可带 `History` 做时间感知解释）重建树并保留唯一撤回点，
+`Undo()` 撤回一次重新解释、恢复旧视角（旧树）；只能撤回一次，再次
+`Undo()` 返回 false。
+
 ## 用法
 
 ```go
@@ -96,6 +128,25 @@ c2 := perfsample.CompareMapped(oldTree, newTree, m)
 for _, c := range c2.Shared() {
     fmt.Println(c.Kind, c.FullName(), c.DeltaTotal) // symbol / sample / unmatched
 }
+
+// 模块卸载后在同地址重载：按 (地址, 时刻) 取当时的装载关系，区分代次
+h := perfsample.NewModuleHistory(
+    perfsample.ModuleSpan{Module: "libv1.so", Base: 0x1000, Limit: 0x2000, Start: 0, End: 100, Generation: 1},
+    perfsample.ModuleSpan{Module: "libv2.so", Base: 0x1000, Limit: 0x2000, Start: 100, Generation: 2},
+)
+session := perfsample.NewSession(samples, "raw")
+session.Apply(perfsample.Reinterpretation{
+    Label: "symbols", History: h,
+    Timed: perfsample.TimedResolverFunc(func(f perfsample.Frame, t uint64, span perfsample.ModuleSpan) []perfsample.FrameInfo {
+        return []perfsample.FrameInfo{{Symbol: "fn"}} // 模块/代次自动按 span 补上
+    }),
+})
+_ = session.Undo() // 撤回一次，恢复 raw 旧视角
+
+// 两份符号资料：三分类且未匹配样本不丢，两侧权重对得上账
+d := perfsample.DiffProfiles(oldTree, newTree, m)
+fmt.Println(d.Balanced, // symbol + sample + uncertain 三类权重之和 == 总权重
+    d.OldSymbolWeight, d.OldSampleWeight, d.OldUncertainWeight)
 ```
 
 ## 验证与演示

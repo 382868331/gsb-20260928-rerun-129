@@ -7,6 +7,9 @@ type FrameInfo struct {
 	Module      string
 	Symbol      string
 	InlineLevel int
+	// Generation 为该帧所属模块的装载代次；留空（0）时由时间感知的
+	// 重解释根据采样时刻自动补上。
+	Generation int
 	// Missing 为 true 时表示该地址仍无法解析，Symbol 可留空。
 	Missing bool
 }
@@ -33,7 +36,7 @@ func (fn ResolverFunc) Resolve(f Frame) []FrameInfo { return fn(f) }
 // Reinterpret 用新的符号资料重新解释同一批原始样本，返回新批次。
 //
 // 不变量：
-//   - 样本数量、顺序、ID、Weight、Provenance 完全不变；
+//   - 样本数量、顺序、ID、Weight、Provenance、Time 完全不变；
 //   - 每个原始帧的 Addr 保留在其解释出的所有逻辑帧上；
 //   - 只改变符号缺失->已解析、函数改名、内联层次展开等“解释”；
 //   - 不新增也不丢失任何权重：新批次总权重与原批次严格相等。
@@ -59,6 +62,7 @@ func Reinterpret(samples []Sample, resolver SymbolResolver) []Sample {
 						Missing:     info.Missing,
 						Module:      info.Module,
 						InlineLevel: info.InlineLevel,
+						Generation:  info.Generation,
 					})
 				}
 			}

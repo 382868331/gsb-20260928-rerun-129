@@ -43,6 +43,10 @@ const (
 	KindSample
 	// KindUnmatched 无法在另一版本找到可靠对应路径。
 	KindUnmatched
+	// KindUncertain 两版都保留了该部分权重，但归属对应仍无法确认：
+	// 既不能算成符号修订（同一身份），也不能报成采样权重变化。
+	// 权重绝不丢弃，单列在此类别供人工核对。
+	KindUncertain
 )
 
 // String 返回差异类型的稳定描述。
@@ -54,6 +58,8 @@ func (k ChangeKind) String() string {
 		return "sample"
 	case KindUnmatched:
 		return "unmatched"
+	case KindUncertain:
+		return "uncertain"
 	default:
 		return "same"
 	}
@@ -83,10 +89,16 @@ func DisplayKey(key string) string {
 		inline = "[i" + rest[i+len(inlineSep):] + "]"
 		rest = rest[:i]
 	}
-	if module != "" {
-		return module + "!" + rest + inline
+	// 装载代次限定（\x01g<n>）展示为 [g<n>]，与内联限定并列。
+	generation := ""
+	if i := strings.Index(rest, genSep); i >= 0 {
+		generation = "[g" + rest[i+len(genSep):] + "]"
+		rest = rest[:i]
 	}
-	return rest + inline
+	if module != "" {
+		return module + "!" + rest + inline + generation
+	}
+	return rest + inline + generation
 }
 
 // Comparison 是两次运行在全部调用路径上的对比结果。

@@ -10,10 +10,12 @@ type Move struct {
 	OldModule string
 	OldSymbol string
 	OldInline int
+	OldGen    int
 
 	NewModule string
 	NewSymbol string
 	NewInline int
+	NewGen    int
 }
 
 // Mapping 是一组跨构建版本的帧对应关系。
@@ -26,8 +28,8 @@ type Mapping struct {
 func NewMapping(moves ...Move) *Mapping {
 	m := &Mapping{moves: map[string]string{}}
 	for _, mv := range moves {
-		old := frameIdentity(mv.OldModule, mv.OldSymbol, mv.OldInline)
-		newK := frameIdentity(mv.NewModule, mv.NewSymbol, mv.NewInline)
+		old := frameIdentityGen(mv.OldModule, mv.OldGen, mv.OldSymbol, mv.OldInline)
+		newK := frameIdentityGen(mv.NewModule, mv.NewGen, mv.NewSymbol, mv.NewInline)
 		m.moves[old] = newK
 	}
 	return m

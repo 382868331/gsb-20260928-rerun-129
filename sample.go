@@ -19,6 +19,11 @@ type Frame struct {
 	// 数字越大越靠近调用方）。不同内联层次是不同身份，递归 f->f
 	// 仍各自保留。
 	InlineLevel int
+	// Generation 是该帧所属模块在进程内的装载代次：模块第一次加载为 1，
+	// 卸载后在同一（或不同）地址重新加载则代次递增。同一地址在不同代次
+	// 属于不同代码，必须按 (模块, 代次, 符号/地址, 内联层次) 区分身份，
+	// 不能只按地址把两个版本折叠成一个函数。0 表示未跟踪代次（旧行为）。
+	Generation int
 }
 
 // Provenance 记录样本的来源与符号版本，保证结果可追溯：
@@ -40,6 +45,10 @@ type Sample struct {
 	Stack  []Frame
 	Weight float64
 	Prov   Provenance
+	// Time 是该样本被采集到的时刻（单调时钟单位由采集方定义，通常为纳秒）。
+	// 0 表示时刻未知。重新解释只改帧解释，时刻与原始地址、权重一样原样保留，
+	// 因此“相同地址在不同时间属于不同模块”的样本可以按采样当时的装载关系区分。
+	Time uint64
 }
 
 func (s Sample) weight() float64 {
@@ -50,26 +59,27 @@ func (s Sample) weight() float64 {
 }
 
 // frameKey 返回该层在执行树中的归并键。身份由
-// (模块, 符号/地址, 内联层次) 共同决定：
-//   - 已解析符号：同名函数位于不同模块或不同内联层次时分别保留身份；
-//   - 缺失符号：按地址区分，避免把不同的未知函数错误折叠；
-//   - 未指定模块（空）且无内联层次时，键退化为纯符号名，与第一版兼容。
+// (模块, 装载代次, 符号/地址, 内联层次) 共同决定：
+//   - 已解析符号：同名函数位于不同模块、不同代次或不同内联层次时分别保留身份；
+//   - 缺失符号：按 (代次, 地址) 区分，避免把卸载后重新加载的不同代码
+//     或不同的未知函数错误折叠；
+//   - 未指定模块/代次/内联层次的旧样本键退化为纯符号名，与第一版兼容。
 //
 // 跨符号版本仍可能落在同一键上（符号名不变的情形），版本信息记录在
 // 节点的来源明细中；符号改名/移动由跨版本映射负责，而不是在这里折叠。
 func frameKey(f Frame) string {
 	if f.Missing || f.Symbol == "" {
 		if f.Addr != 0 {
-			return frameIdentity(f.Module, unknownPrefix+addrHex(f.Addr)+")", f.InlineLevel)
+			return frameIdentityGen(f.Module, f.Generation, unknownPrefix+addrHex(f.Addr)+")", f.InlineLevel)
 		}
-		return frameIdentity(f.Module, unknownName, f.InlineLevel)
+		return frameIdentityGen(f.Module, f.Generation, unknownName, f.InlineLevel)
 	}
-	return frameIdentity(f.Module, f.Symbol, f.InlineLevel)
+	return frameIdentityGen(f.Module, f.Generation, f.Symbol, f.InlineLevel)
 }
 
 // frameIdentity 用与 pathSep 不同的分隔符拼出稳定的帧身份键。
 // 仅在确实携带额外身份（模块/内联层次）时加限定，保证旧样本
-// （Module 为空、InlineLevel 为 0）生成的键与第一版完全一致。
+// （Module 为空、InlineLevel 为 0、Generation 为 0）生成的键与第一版完全一致。
 func frameIdentity(module, symbol string, inlineLevel int) string {
 	switch {
 	case module != "" && inlineLevel > 0:
@@ -83,11 +93,22 @@ func frameIdentity(module, symbol string, inlineLevel int) string {
 	}
 }
 
+// frameIdentityGen 在帧身份键中追加装载代次限定。仅当代次 > 0 时追加，
+// 保证未跟踪代次的旧样本键与之前版本完全一致。
+func frameIdentityGen(module string, generation int, symbol string, inlineLevel int) string {
+	base := frameIdentity(module, symbol, inlineLevel)
+	if generation > 0 {
+		base += genSep + itoa(generation)
+	}
+	return base
+}
+
 const (
 	unknownName   = "(unknown)"
 	unknownPrefix = "(unknown@0x"
 	moduleSep     = "\x01:"
 	inlineSep     = "\x01i"
+	genSep        = "\x01g"
 )
 
 func itoa(n int) string {

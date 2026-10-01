@@ -23,6 +23,8 @@ type Node struct {
 	Symbol string
 	// InlineLevel 为该节点帧的内联层次，0 表示物理函数。
 	InlineLevel int
+	// Generation 为该节点帧所属模块的装载代次，0 表示未跟踪。
+	Generation int
 
 	// keyPath 记录该节点相对虚拟根的完整键路径，仅供内部跨版本回退定位。
 	keyPath string
@@ -107,10 +109,12 @@ func (t *Tree) AddSample(s Sample) {
 		}
 		if f.Missing || f.Symbol == "" {
 			child.HasMissing = true
+			child.Generation = f.Generation
 		} else {
 			child.Module = f.Module
 			child.InlineLevel = f.InlineLevel
 			child.Symbol = f.Symbol
+			child.Generation = f.Generation
 		}
 		child.TotalWeight += w
 		child.SampleCount++

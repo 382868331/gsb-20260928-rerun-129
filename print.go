@@ -20,6 +20,9 @@ func walkPrint(b *strings.Builder, n *Node, indent string) {
 		if c.InlineLevel > 0 {
 			name += fmt.Sprintf(" [inline:%d]", c.InlineLevel)
 		}
+		if c.Generation > 0 {
+			name += fmt.Sprintf(" [gen:%d]", c.Generation)
+		}
 		if c.Module != "" {
 			name += fmt.Sprintf(" (%s)", c.Module)
 		}
