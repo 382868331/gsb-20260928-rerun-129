@@ -94,6 +94,29 @@
 `Undo()` 撤回一次重新解释、恢复旧视角（旧树）；只能撤回一次，再次
 `Undo()` 返回 false。
 
+## 多采样器联合时间线（第四版新增）
+
+多个采样器记录同一次运行时，`SourceTrack` 保留每个来源自己的本地采样时间、
+实际覆盖范围和已知时钟偏移范围（`global = local + offset`）。偏移上下限不
+相等时，样本在联合时间线上是一个可能区间，而不是一个被强行选定的点：
+
+- `ReinterpretJoint` 只在整个可能区间都属于同一模块代次时归属热点；可能
+  跨越模块装卸、地址复用或符号更新边界的帧聚合为 `(time-uncertain@0x...)`，
+  节点以 `TimeUncertain` 明确标示，不会归入任意一次装载；
+- `JointSession.AdjustAlignment` 可单独调整某个来源的对齐判断并立即查看
+  归属变化；原始样本、当前视角和 `SaveView` 保存的先前结论互不覆盖；
+- `UndoLastAlignment` 只恢复最近一次对齐修改影响到的归属，符号资料更新
+  不属于对齐撤回，也不会被回滚；
+- `CompareJointRuns` 按同一来源比较热点：`Observed*` 是该侧实际观察到的
+  全部权重，`Comparable*` 只累计两侧具有相同可能时间区间的观测，
+  `DeltaComparable` 才表示真实权重变化；覆盖不同导致的不可比权重仍保留，
+  缺少观察绝不补成 0；
+- 部分来源缺失时，只在两侧都存在的来源内配对；缺失来源的样本保留在
+  已观察权重中，不参与差值；
+- `JointSessionState`/JSON 可保存原始样本、来源覆盖、当前偏移、模块历史、
+  撤销元数据和已保存视角；符号 resolver 是代码规则，重开时由调用方重新
+  提供相同实例，所选视图可从状态复现。
+
 ## 用法
 
 ```go
@@ -147,6 +170,30 @@ _ = session.Undo() // 撤回一次，恢复 raw 旧视角
 d := perfsample.DiffProfiles(oldTree, newTree, m)
 fmt.Println(d.Balanced, // symbol + sample + uncertain 三类权重之和 == 总权重
     d.OldSymbolWeight, d.OldSampleWeight, d.OldUncertainWeight)
+
+// 多采样器：本地时钟允许 [OffsetMin,OffsetMax] 的已知偏移范围
+run := perfsample.NewJointRun("run",
+    perfsample.NewSourceTrack("cpu", samples, 0, 50),
+)
+session := perfsample.NewJointSession(run, "bounded-alignment")
+session.SetSymbols(history, perfsample.JointResolverFunc(
+    func(f perfsample.Frame, local uint64, tr *perfsample.SourceTrack, span perfsample.ModuleSpan) []perfsample.FrameInfo {
+        symbol := "oldfn"
+        if span.Generation > 1 { symbol = "newfn" }
+        return []perfsample.FrameInfo{{Symbol: symbol}}
+    },
+), "symbols-v3")
+session.SaveView("before-manual-alignment")
+session.AdjustAlignment("cpu", 0, 0) // 用户把偏移范围收窄为精确对齐
+session.UndoLastAlignment()          // 只撤回这次对齐，不回滚符号更新
+
+state, _ := session.SaveState()
+data, _ := json.Marshal(state)       // 保存；重开后 RestoreJointSession(state, resolver)
+jc := perfsample.CompareJointRuns(oldJointRun, newJointRun)
+for _, h := range jc.Hotspots {
+    // h.OldObserved/h.NewObserved 保留覆盖差异；h.DeltaComparable 才是真实权重变化
+    _ = h
+}
 ```
 
 ## 验证与演示
@@ -160,3 +207,7 @@ go run ./cmd/perfdiff  # 仅使用内嵌人工样本，展示两版对比
 跨采集器合并批次的权重对账、两版同路径对比与新增路径识别；以及符号
 补全后的权重守恒、内联层次展开、同名函数按模块区分、跨版本函数移动、
 样本锚点回退、未匹配路径标注，和 symbol/sample 差异分类。
+
+联合时间线测试覆盖偏移范围跨模块边界时的 time-uncertain 归属、人工调整
+对齐后的归属变化与单步撤销、部分来源缺失、覆盖不同与真实权重变化分离，
+以及 JSON 保存重开后所选视图和撤销元数据复现。

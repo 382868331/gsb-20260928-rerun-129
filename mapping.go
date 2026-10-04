@@ -51,7 +51,8 @@ func (m *Mapping) MapFrame(frameKey string) (mapped string, ok bool) {
 func (m *Mapping) TranslatePath(oldPath []string) (newPath []string, ok bool) {
 	newPath = make([]string, 0, len(oldPath))
 	for _, key := range oldPath {
-		if strings.HasPrefix(key, unknownPrefix) || key == unknownName {
+		if strings.HasPrefix(key, unknownPrefix) || strings.HasPrefix(key, uncertainPrefix) ||
+			key == unknownName || key == uncertainName {
 			return nil, false
 		}
 		if mapped, found := m.MapFrame(key); found {

@@ -29,6 +29,9 @@ func walkPrint(b *strings.Builder, n *Node, indent string) {
 		if c.HasMissing {
 			name += " [missing-symbol]"
 		}
+		if c.TimeUncertain {
+			name += " [time-uncertain]"
+		}
 		b.WriteString(fmt.Sprintf("%s- %s self=%.0f total=%.0f samples=%d\n",
 			indent, name, c.SelfWeight, c.TotalWeight, c.SampleCount))
 		walkPrint(b, c, indent+"  ")

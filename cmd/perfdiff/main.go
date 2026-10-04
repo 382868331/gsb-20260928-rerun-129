@@ -68,6 +68,65 @@ func main() {
 
 	demoReinterpretAndMapping()
 	demoReloadDiffAndUndo()
+	demoJointAlignmentAndCoverage()
+}
+
+// demoJointAlignmentAndCoverage 演示多采样器偏移范围、人工对齐、覆盖差异
+// 与真实权重变化的分离。
+func demoJointAlignmentAndCoverage() {
+	fmt.Println("\n=== 多采样器联合时间线：偏移范围不强行归到某次装卸 ===")
+	history := perfsample.NewModuleHistory(
+		perfsample.ModuleSpan{Module: "libv1.so", Base: 0x1000, Limit: 0x2000, Start: 0, End: 100, Generation: 1},
+		perfsample.ModuleSpan{Module: "libv2.so", Base: 0x1000, Limit: 0x2000, Start: 100, End: 0, Generation: 2},
+	)
+	samples := func() []perfsample.Sample {
+		return []perfsample.Sample{
+			{ID: "a", Weight: 3, Time: 40, Prov: perfsample.Provenance{Source: "cpu"},
+				Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1010}}},
+			{ID: "b", Weight: 4, Time: 60, Prov: perfsample.Provenance{Source: "cpu"},
+				Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1010}}},
+		}
+	}
+	resolver := perfsample.JointResolverFunc(func(f perfsample.Frame, local uint64, tr *perfsample.SourceTrack, span perfsample.ModuleSpan) []perfsample.FrameInfo {
+		if span.Generation == 1 {
+			return []perfsample.FrameInfo{{Symbol: "oldfn"}}
+		}
+		return []perfsample.FrameInfo{{Symbol: "newfn"}}
+	})
+	session := perfsample.NewJointSession(
+		perfsample.NewJointRun("run", perfsample.NewSourceTrack("cpu", samples(), 0, 50)),
+		"bounded",
+	)
+	session.SetSymbols(history, resolver, "symbols-v3")
+	fmt.Print(session.Current().Tree)
+	session.SaveView("bounded-before-adjustment")
+	session.AdjustAlignment("cpu", 0, 0)
+	fmt.Println("把 cpu 的偏移范围收窄为精确 0 后：")
+	fmt.Print(session.Current().Tree)
+	session.UndoLastAlignment()
+	fmt.Println("撤回该对齐修改后恢复 time-uncertain：")
+	fmt.Print(session.Current().Tree)
+
+	oldTrack := &perfsample.SourceTrack{ID: "cpu", OffsetMin: 0, OffsetMax: 0,
+		CoverageStart: 0, CoverageEnd: 100, Samples: samples()}
+	newSamples := samples()
+	newSamples[0].Weight = 8
+	newSamples = append(newSamples, perfsample.Sample{ID: "c", Weight: 5, Time: 80,
+		Prov: perfsample.Provenance{Source: "mem"}, Stack: []perfsample.Frame{{Symbol: "main"}, {Missing: true, Addr: 0x1010}}})
+	newTracks := []*perfsample.SourceTrack{
+		{ID: "cpu", Name: "cpu", OffsetMin: 0, OffsetMax: 0, CoverageStart: 0, CoverageEnd: 100, Samples: newSamples[:2]},
+		{ID: "mem", Name: "mem", OffsetMin: 0, OffsetMax: 0, CoverageStart: 0, CoverageEnd: 100, Samples: newSamples[2:]},
+	}
+	cmp := perfsample.CompareJointRuns(
+		perfsample.NewJointRun("old", oldTrack),
+		perfsample.NewJointRun("new", newTracks...),
+	)
+	fmt.Println("覆盖差异不补零；只对同来源、同时间区间的观测计算真实 delta：")
+	for _, h := range cmp.Hotspots {
+		fmt.Printf("  %s observed=%.0f/%.0f comparable=%.0f/%.0f delta=%+.0f uncertain=%d\n",
+			h.FullName(), h.OldObserved, h.NewObserved, h.OldComparable, h.NewComparable,
+			h.DeltaComparable, h.UncertainSamples)
+	}
 }
 
 // demoReloadDiffAndUndo 演示第三版能力：

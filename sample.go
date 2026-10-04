@@ -24,6 +24,9 @@ type Frame struct {
 	// 属于不同代码，必须按 (模块, 代次, 符号/地址, 内联层次) 区分身份，
 	// 不能只按地址把两个版本折叠成一个函数。0 表示未跟踪代次（旧行为）。
 	Generation int
+	// Uncertain 表示跨采集器时钟只能给出偏移范围，且该地址在全部可能时刻
+	// 可能落入不同模块/代次。此帧不得强行归属到任何一次装卸。
+	Uncertain bool
 }
 
 // Provenance 记录样本的来源与符号版本，保证结果可追溯：
@@ -68,6 +71,12 @@ func (s Sample) weight() float64 {
 // 跨符号版本仍可能落在同一键上（符号名不变的情形），版本信息记录在
 // 节点的来源明细中；符号改名/移动由跨版本映射负责，而不是在这里折叠。
 func frameKey(f Frame) string {
+	if f.Uncertain {
+		if f.Addr != 0 {
+			return uncertainPrefix + addrHex(f.Addr) + ")"
+		}
+		return uncertainName
+	}
 	if f.Missing || f.Symbol == "" {
 		if f.Addr != 0 {
 			return frameIdentityGen(f.Module, f.Generation, unknownPrefix+addrHex(f.Addr)+")", f.InlineLevel)
@@ -104,11 +113,13 @@ func frameIdentityGen(module string, generation int, symbol string, inlineLevel 
 }
 
 const (
-	unknownName   = "(unknown)"
-	unknownPrefix = "(unknown@0x"
-	moduleSep     = "\x01:"
-	inlineSep     = "\x01i"
-	genSep        = "\x01g"
+	unknownName     = "(unknown)"
+	unknownPrefix   = "(unknown@0x"
+	uncertainName   = "(time-uncertain)"
+	uncertainPrefix = "(time-uncertain@0x"
+	moduleSep       = "\x01:"
+	inlineSep       = "\x01i"
+	genSep          = "\x01g"
 )
 
 func itoa(n int) string {

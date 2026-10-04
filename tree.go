@@ -25,6 +25,8 @@ type Node struct {
 	InlineLevel int
 	// Generation 为该节点帧所属模块的装载代次，0 表示未跟踪。
 	Generation int
+	// TimeUncertain 表示跨来源偏移范围无法确定该节点属于哪次模块装卸。
+	TimeUncertain bool
 
 	// keyPath 记录该节点相对虚拟根的完整键路径，仅供内部跨版本回退定位。
 	keyPath string
@@ -116,6 +118,7 @@ func (t *Tree) AddSample(s Sample) {
 			child.Symbol = f.Symbol
 			child.Generation = f.Generation
 		}
+		child.TimeUncertain = child.TimeUncertain || f.Uncertain
 		child.TotalWeight += w
 		child.SampleCount++
 		if s.ID != "" {
