@@ -94,6 +94,63 @@
 `Undo()` 撤回一次重新解释、恢复旧视角（旧树）；只能撤回一次，再次
 `Undo()` 返回 false。
 
+## 多采样器联合分析与对齐判断（第四版新增）
+
+多个采样器记录同一程序时，各自时钟与参考时间线之间只有**已知偏移
+范围**（`OffsetRange{Min, Max}`），而不是精确对齐。`Track` 把每个来源
+的原始样本与其声明的偏移范围放在一起，`NewJointSession`/`NewJointView`
+构建联合视图：
+
+- 各来源保留自己的采样时刻与覆盖范围（`AlignedTrack.CoverageStart/End`、
+  `RefCoverage`），对齐只发生在视图层，原始样本永不被修改；
+- 每帧归属按整个可行偏移区间判定（`ModuleHistory.LookupRange`）：
+  区间内只会属于同一个装载区间才是 `AttrResolved`；先后无法确定、
+  可能属于多次装卸的是 `AttrAmbiguous`——明确标示候选，**不强行归到
+  某次模块装卸**，也不计入任何热点；任何偏移下都不在已知模块内的是
+  `AttrUnattributed`；
+- `JointSession.SetAlignment(source, range)` 在声明范围内收紧某来源的
+  对齐判断，视图立即重建，`Previous()` 保留先前结论可对照归属变化；
+  `Undo()` 撤回一次对齐修改，**只恢复它影响的来源**，其他来源的对齐
+  与符号更新不受影响；
+- `Save()`/`RestoreJointSession` 把视图选择（标签、各来源对齐判断、
+  符号更新记录）序列化为 JSON，重开后用相同原始轨道复现同一视图。
+
+`CompareRuns(a, b)` 比较两段运行，把采样覆盖不同与真实权重变化分开：
+
+- 只有双方都有采样覆盖的对齐区间内的权重差才计入 `Delta`；
+- 仅一侧有观察的区间单列在 `OnlyA/OnlyB` 与 `CoverageOnlyA/B`，
+  **缺少观察的区间不能当成零开销**；
+- 归属不定与无法归属的权重各自单列，绝不丢样本，`Balanced` 对账；
+- 报告同时展示模块地址复用（`ModuleReuse`，同地址不同代次）、
+  符号更新（`SymbolUpdates`）与部分来源缺失（`MissingInA/B`）。
+
+```go
+h := perfsample.NewModuleHistory(
+    perfsample.ModuleSpan{Module: "libv1.so", Base: 0x1000, Limit: 0x2000, Start: 0, End: 100, Generation: 1},
+    perfsample.ModuleSpan{Module: "libv2.so", Base: 0x1000, Limit: 0x2000, Start: 100, Generation: 2},
+)
+tracks := []perfsample.Track{
+    {Source: "cpu-prof", Samples: cpuSamples, Offset: perfsample.OffsetRange{Min: -10, Max: 10}},
+    {Source: "gpu-prof", Samples: gpuSamples, Offset: perfsample.OffsetRange{Min: -5, Max: 5}},
+}
+s := perfsample.NewJointSession("run-1", tracks, h)
+for _, a := range s.View().Ambiguous() {
+    fmt.Println(a.Source, a.Name, a.SelfWeight, len(a.Candidates)) // 先后不定，单列
+}
+_ = s.SetAlignment("cpu-prof", perfsample.OffsetRange{Min: 0, Max: 0}) // 收紧对齐判断
+_ = s.Previous() // 先前结论仍可对照
+_ = s.Undo()     // 只撤回 cpu-prof 的对齐修改
+
+rc := perfsample.CompareRuns(runA.View(), runB.View())
+for _, d := range rc.Hotspots {
+    fmt.Println(d.Name, d.Delta, d.OnlyA, d.OnlyB) // 覆盖差异与真实变化分开
+}
+state, _ := s.Save()
+reopened, _ := perfsample.RestoreJointSession(tracks, h, state) // 复现同一视图
+_ = reopened
+```
+
+
 ## 用法
 
 ```go
@@ -159,4 +216,6 @@ go run ./cmd/perfdiff  # 仅使用内嵌人工样本，展示两版对比
 测试覆盖：递归两层不被折叠、自身权重之和等于根总权重、缺失符号保留、
 跨采集器合并批次的权重对账、两版同路径对比与新增路径识别；以及符号
 补全后的权重守恒、内联层次展开、同名函数按模块区分、跨版本函数移动、
-样本锚点回退、未匹配路径标注，和 symbol/sample 差异分类。
+样本锚点回退、未匹配路径标注，和 symbol/sample 差异分类；以及多采样器
+联合视图中的归属判定（确定/不定/无法归属）、对齐判断的收紧与精确撤回、
+覆盖差异与真实权重变化的分离、保存重开复现视图、地址复用与来源缺失展示。

@@ -93,6 +93,93 @@ func (h *ModuleHistory) Lookup(addr, t uint64) (span ModuleSpan, ok bool) {
 	return *found, true
 }
 
+// LookupRange 回答“采样时刻只已知落在参考时间线区间 [tMin, tMax] 内时，
+// 地址 addr 可能属于哪些装载区间”。这用于多采样器联合分析：来源时钟
+// 与参考时钟之间只有已知偏移范围，而不是精确对齐，因此一个样本的参考
+// 时刻本身就是一个区间。
+//
+// 返回所有与该时刻区间相交、且地址落在其范围内的候选 Span（按起始时刻
+// 排序）。full 为 true 当且仅当恰好只有一个候选、且它完整覆盖整个时刻
+// 区间——只有此时归属才是确定的；多个候选（先后无法确定）或唯一候选
+// 不能覆盖整个区间（区间内存在未登记的空隙）时 full 为 false，调用方
+// 必须明确标示为归属不定，不能强行归到某一次装载。
+func (h *ModuleHistory) LookupRange(addr uint64, tMin, tMax int64) (spans []ModuleSpan, full bool) {
+	if h == nil {
+		return nil, false
+	}
+	for i := range h.spans {
+		s := &h.spans[i]
+		if addr < s.Base || (s.Limit != 0 && addr >= s.Limit) {
+			continue
+		}
+		start := int64(s.Start)
+		end := int64(s.End)
+		if s.End == 0 {
+			end = int64(^uint64(0) >> 1) // 仍处装载状态：视为延伸到无穷远
+		}
+		if end < tMin || start > tMax {
+			continue
+		}
+		spans = append(spans, *s)
+	}
+	if len(spans) == 1 {
+		s := spans[0]
+		start := int64(s.Start)
+		end := int64(s.End)
+		if s.End == 0 {
+			end = int64(^uint64(0) >> 1)
+		}
+		full = start <= tMin && end >= tMax
+	}
+	return spans, full
+}
+
+// ReuseEvent 描述一段被多次装载复用的地址区间：同一地址范围在不同
+// 时间属于不同模块/不同代次的代码。联合分析视图必须把这种复用展示
+// 出来，否则同地址的样本会被误读成同一个函数。
+type ReuseEvent struct {
+	Base   uint64
+	Limit  uint64
+	Owners []ModuleSpan // 复用该地址区间的各次装载（不同模块或不同代次）
+}
+
+// AddressReuse 返回历史中所有被多次装载复用的地址区间。
+// 按地址区间相交的传递闭包分组，组内存在不同 (模块, 代次) 身份时
+// 记为一次复用事件；输出按基址排序，保证展示稳定。
+func (h *ModuleHistory) AddressReuse() []ReuseEvent {
+	if h == nil {
+		return nil
+	}
+	spans := make([]ModuleSpan, len(h.spans))
+	copy(spans, h.spans)
+	sort.SliceStable(spans, func(i, j int) bool { return spans[i].Base < spans[j].Base })
+
+	var events []ReuseEvent
+	for i := 0; i < len(spans); {
+		// 以 spans[i] 为起点扩张地址相交的传递闭包。
+		j := i + 1
+		limit := spans[i].Limit
+		for j < len(spans) && spans[j].Base < limit {
+			if spans[j].Limit > limit {
+				limit = spans[j].Limit
+			}
+			j++
+		}
+		group := spans[i:j]
+		identities := map[string]bool{}
+		for _, s := range group {
+			identities[frameIdentityGen(s.Module, s.Generation, "", 0)] = true
+		}
+		if len(identities) > 1 {
+			owners := make([]ModuleSpan, len(group))
+			copy(owners, group)
+			events = append(events, ReuseEvent{Base: group[0].Base, Limit: limit, Owners: owners})
+		}
+		i = j
+	}
+	return events
+}
+
 // TimedSymbolResolver 结合采样时刻与当时的模块装载关系解释原始帧。
 // span 为该帧地址在时刻 t 命中的装载区间；返回约定与 SymbolResolver 相同：
 // nil/空切片表示保持原帧（但仍会补上模块名与装载代次）。
