@@ -453,6 +453,7 @@ func (v *JointView) splitByCoverage(oMin, oMax int64, oHas bool) *sideStat {
 type alignChange struct {
 	source string
 	old    OffsetRange
+	new    OffsetRange
 }
 
 // JointSession 管理多来源联合分析的当前视图：
@@ -544,7 +545,7 @@ func (s *JointSession) SetAlignment(source string, r OffsetRange) error {
 	if cur, ok := s.align[source]; ok {
 		old = cur
 	}
-	s.undoStack = append(s.undoStack, alignChange{source: source, old: old})
+	s.undoStack = append(s.undoStack, alignChange{source: source, old: old, new: r})
 	s.align[source] = r
 	s.rebuild()
 	return nil
@@ -603,15 +604,33 @@ type jointState struct {
 	Version int                    `json:"version"`
 	Label   string                 `json:"label"`
 	Align   map[string]OffsetRange `json:"align"`
+	Changes []persistedAlignChange `json:"changes,omitempty"`
 	Notes   []string               `json:"notes"`
+}
+
+// persistedAlignChange 记录一次偏移调整的来源、调整前范围与调整后范围。
+// 调整按发生顺序保存，重开后依靠这些记录恢复撤销栈。
+type persistedAlignChange struct {
+	Source string      `json:"source"`
+	Before OffsetRange `json:"before"`
+	After  OffsetRange `json:"after"`
 }
 
 // Save 把当前会话状态序列化为 JSON，保存后重开可复现所选视图。
 func (s *JointSession) Save() ([]byte, error) {
+	changes := make([]persistedAlignChange, len(s.undoStack))
+	for i, ch := range s.undoStack {
+		changes[i] = persistedAlignChange{
+			Source: ch.source,
+			Before: ch.old,
+			After:  ch.new,
+		}
+	}
 	return json.Marshal(jointState{
-		Version: 1,
+		Version: 2,
 		Label:   s.label,
 		Align:   s.align,
+		Changes: changes,
 		Notes:   s.notes,
 	})
 }
@@ -624,7 +643,7 @@ func RestoreJointSession(tracks []Track, history *ModuleHistory, data []byte) (*
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("joint: decode state: %w", err)
 	}
-	if st.Version != 1 {
+	if st.Version != 1 && st.Version != 2 {
 		return nil, fmt.Errorf("joint: unsupported state version %d", st.Version)
 	}
 	s := &JointSession{
@@ -635,15 +654,50 @@ func RestoreJointSession(tracks []Track, history *ModuleHistory, data []byte) (*
 		interpreted: map[string][]Sample{},
 		notes:       append([]string{}, st.Notes...),
 	}
-	for src, r := range st.Align {
-		tr := s.findTrack(src)
-		if tr == nil {
-			return nil, fmt.Errorf("joint: state references unknown source %q", src)
+	if st.Version == 1 {
+		for src, r := range st.Align {
+			tr := s.findTrack(src)
+			if tr == nil {
+				return nil, fmt.Errorf("joint: state references unknown source %q", src)
+			}
+			if r.Min > r.Max || !tr.Offset.Contains(r) {
+				return nil, fmt.Errorf("joint: saved alignment for %q outside declared range", src)
+			}
+			s.align[src] = r
 		}
-		if r.Min > r.Max || !tr.Offset.Contains(r) {
-			return nil, fmt.Errorf("joint: saved alignment for %q outside declared range", src)
+	} else {
+		for i, ch := range st.Changes {
+			tr := s.findTrack(ch.Source)
+			if tr == nil {
+				return nil, fmt.Errorf("joint: state change %d references unknown source %q", i, ch.Source)
+			}
+			before := tr.Offset
+			if current, ok := s.align[ch.Source]; ok {
+				before = current
+			}
+			if ch.Before != before {
+				return nil, fmt.Errorf("joint: state change %d for %q has before range [%d,%d], want [%d,%d]",
+					i, ch.Source, ch.Before.Min, ch.Before.Max, before.Min, before.Max)
+			}
+			if ch.After.Min > ch.After.Max || !tr.Offset.Contains(ch.After) {
+				return nil, fmt.Errorf("joint: state change %d for %q has invalid after range [%d,%d]",
+					i, ch.Source, ch.After.Min, ch.After.Max)
+			}
+			s.align[ch.Source] = ch.After
+			s.undoStack = append(s.undoStack, alignChange{
+				source: ch.Source,
+				old:    ch.Before,
+				new:    ch.After,
+			})
 		}
-		s.align[src] = r
+		if len(st.Align) != len(s.align) {
+			return nil, fmt.Errorf("joint: saved alignment state does not match changes")
+		}
+		for src, r := range st.Align {
+			if current, ok := s.align[src]; !ok || current != r {
+				return nil, fmt.Errorf("joint: saved alignment for %q does not match changes", src)
+			}
+		}
 	}
 	s.rebuild()
 	return s, nil
