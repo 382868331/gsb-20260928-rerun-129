@@ -449,10 +449,12 @@ func (v *JointView) splitByCoverage(oMin, oMax int64, oHas bool) *sideStat {
 	return st
 }
 
-// alignChange 记录一次对齐修改前的状态，用于精确撤回。
+// alignChange 记录一次对齐修改的前后状态，用于精确撤回。
+// 它随会话状态一起持久化，保存重开后仍可撤回最近的对齐修改。
 type alignChange struct {
-	source string
-	old    OffsetRange
+	Source string      `json:"source"`
+	Old    OffsetRange `json:"old"`
+	New    OffsetRange `json:"new"`
 }
 
 // JointSession 管理多来源联合分析的当前视图：
@@ -544,7 +546,7 @@ func (s *JointSession) SetAlignment(source string, r OffsetRange) error {
 	if cur, ok := s.align[source]; ok {
 		old = cur
 	}
-	s.undoStack = append(s.undoStack, alignChange{source: source, old: old})
+	s.undoStack = append(s.undoStack, alignChange{Source: source, Old: old, New: r})
 	s.align[source] = r
 	s.rebuild()
 	return nil
@@ -562,11 +564,11 @@ func (s *JointSession) Undo() bool {
 	}
 	ch := s.undoStack[n-1]
 	s.undoStack = s.undoStack[:n-1]
-	tr := s.findTrack(ch.source)
-	if tr != nil && ch.old == tr.Offset {
-		delete(s.align, ch.source)
+	tr := s.findTrack(ch.Source)
+	if tr != nil && ch.Old == tr.Offset {
+		delete(s.align, ch.Source)
 	} else {
-		s.align[ch.source] = ch.old
+		s.align[ch.Source] = ch.Old
 	}
 	s.rebuild()
 	return true
@@ -597,22 +599,26 @@ func (s *JointSession) ApplySymbols(label string, r Reinterpretation) {
 }
 
 // jointState 是 JointSession 的可序列化状态：视图标签、各来源当前
-// 对齐判断与符号更新记录。符号资料本身（解析器函数）不可序列化，
-// 重开后若曾应用符号更新，需按相同顺序重新 ApplySymbols。
+// 对齐判断、符号更新记录与对齐撤销历史（每次调整的前后范围与来源）。
+// 符号资料本身（解析器函数）不可序列化，重开后若曾应用符号更新，
+// 需按相同顺序重新 ApplySymbols。
 type jointState struct {
 	Version int                    `json:"version"`
 	Label   string                 `json:"label"`
 	Align   map[string]OffsetRange `json:"align"`
 	Notes   []string               `json:"notes"`
+	Undo    []alignChange          `json:"undo,omitempty"`
 }
 
-// Save 把当前会话状态序列化为 JSON，保存后重开可复现所选视图。
+// Save 把当前会话状态序列化为 JSON，保存后重开可复现所选视图，
+// 并保留对齐撤销历史：重开后仍可撤回保存前的最近对齐调整。
 func (s *JointSession) Save() ([]byte, error) {
 	return json.Marshal(jointState{
 		Version: 1,
 		Label:   s.label,
 		Align:   s.align,
 		Notes:   s.notes,
+		Undo:    append([]alignChange{}, s.undoStack...),
 	})
 }
 
@@ -644,6 +650,19 @@ func RestoreJointSession(tracks []Track, history *ModuleHistory, data []byte) (*
 			return nil, fmt.Errorf("joint: saved alignment for %q outside declared range", src)
 		}
 		s.align[src] = r
+	}
+	for _, ch := range st.Undo {
+		tr := s.findTrack(ch.Source)
+		if tr == nil {
+			return nil, fmt.Errorf("joint: undo history references unknown source %q", ch.Source)
+		}
+		if ch.Old.Min > ch.Old.Max || !tr.Offset.Contains(ch.Old) {
+			return nil, fmt.Errorf("joint: undo history for %q has old range outside declared range", ch.Source)
+		}
+		if ch.New.Min > ch.New.Max || !tr.Offset.Contains(ch.New) {
+			return nil, fmt.Errorf("joint: undo history for %q has new range outside declared range", ch.Source)
+		}
+		s.undoStack = append(s.undoStack, ch)
 	}
 	s.rebuild()
 	return s, nil

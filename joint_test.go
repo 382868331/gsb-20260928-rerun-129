@@ -229,6 +229,145 @@ func TestJointSessionSaveRestore(t *testing.T) {
 	}
 }
 
+// 连续多次对齐调整后保存重开，撤销历史仍然完整：重开后可逐次撤回
+// 最近的调整，精确恢复模块装卸边界处归属不定的样本与候选，且每次
+// 撤销只影响对应来源，总权重与其他来源的归属结论保持不变。
+func TestJointSessionUndoPersistedAcrossSave(t *testing.T) {
+	h := jointHistory()
+	tracks := []Track{
+		{Source: "cpu", Offset: OffsetRange{Min: -10, Max: 10}, Samples: []Sample{
+			jointSample("a", 95, 1, "cpu"), // 边界样本：偏移不定则先后无法确定
+		}},
+		{Source: "gpu", Offset: OffsetRange{Min: -5, Max: 5}, Samples: []Sample{
+			jointSample("b", 97, 2, "gpu"),
+		}},
+	}
+	s := NewJointSession("s", tracks, h)
+	if s.CanUndo() {
+		t.Fatal("no undo expected initially")
+	}
+	// 连续调整：cpu 两次、gpu 一次。
+	if err := s.SetAlignment("cpu", OffsetRange{Min: -4, Max: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAlignment("cpu", OffsetRange{Min: 0, Max: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAlignment("gpu", OffsetRange{Min: 5, Max: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if !approxEq(s.View().AmbiguousWeight(), 0) {
+		t.Fatalf("after aligns ambiguous = %v", s.View().AmbiguousWeight())
+	}
+	totalBefore := s.View().TotalWeight()
+
+	data, err := s.Save()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := RestoreJointSession(tracks, h, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.CanUndo() {
+		t.Fatal("undo history lost across save/restore")
+	}
+	if !approxEq(back.View().TotalWeight(), totalBefore) {
+		t.Fatalf("total weight changed across restore: %v vs %v", back.View().TotalWeight(), totalBefore)
+	}
+
+	// 重开后撤销最近一次（gpu）：只恢复 gpu 的边界不定归属，
+	// cpu 已收紧的对齐结论与归属保持不变。
+	if !back.Undo() {
+		t.Fatal("undo gpu should succeed")
+	}
+	if !approxEq(back.View().AmbiguousWeight(), 2) {
+		t.Fatalf("after undo gpu ambiguous = %v", back.View().AmbiguousWeight())
+	}
+	amb := back.View().Ambiguous()
+	if len(amb) != 1 || amb[0].Source != "gpu" || len(amb[0].Candidates) != 2 {
+		t.Fatalf("ambiguous after gpu undo = %+v", amb)
+	}
+	if _, ok := hotspotByName(back.View().Hotspots(), "libv1.so!work[g1]"); !ok {
+		t.Fatalf("cpu attribution must survive gpu undo: %+v", back.View().Hotspots())
+	}
+
+	// 继续撤销 cpu 的第二次调整：回到 [-4,4]，边界样本参考时刻
+	// [91,99] 仍完全落在 gen1 内，归属确定；不定权重仍只有 gpu 的。
+	if !back.Undo() {
+		t.Fatal("undo cpu second align should succeed")
+	}
+	al, ok := back.Alignment("cpu")
+	if !ok || al != (OffsetRange{Min: -4, Max: 4}) {
+		t.Fatalf("cpu alignment after undo = %+v ok=%v", al, ok)
+	}
+	if !approxEq(back.View().AmbiguousWeight(), 2) {
+		t.Fatalf("ambiguous after cpu undo = %v", back.View().AmbiguousWeight())
+	}
+	if _, ok := hotspotByName(back.View().Hotspots(), "libv1.so!work[g1]"); !ok {
+		t.Fatalf("cpu sample should resolve to gen1 at [-4,4]: %+v", back.View().Hotspots())
+	}
+
+	// 撤销 cpu 的第一次调整：回到声明的已知范围（视为未调整），
+	// 边界样本重新变为不定，候选包含两次装载。
+	if !back.Undo() {
+		t.Fatal("undo cpu first align should succeed")
+	}
+	al, ok = back.Alignment("cpu")
+	if !ok || al != (OffsetRange{Min: -10, Max: 10}) {
+		t.Fatalf("cpu alignment after full undo = %+v ok=%v", al, ok)
+	}
+	if !approxEq(back.View().AmbiguousWeight(), 3) {
+		t.Fatalf("ambiguous after full undo = %v", back.View().AmbiguousWeight())
+	}
+	amb = back.View().Ambiguous()
+	if len(amb) != 2 {
+		t.Fatalf("ambiguous after full undo = %+v", amb)
+	}
+	for _, a := range amb {
+		if len(a.Candidates) != 2 {
+			t.Fatalf("candidates after full undo = %+v", a)
+		}
+	}
+	if back.CanUndo() || back.Undo() {
+		t.Fatal("undo stack should be exhausted")
+	}
+	// 全程总权重守恒。
+	if !approxEq(back.View().TotalWeight(), totalBefore) {
+		t.Fatalf("total weight not conserved: %v vs %v", back.View().TotalWeight(), totalBefore)
+	}
+}
+
+// 撤销历史中的来源与范围在恢复时校验：越界或未知来源的状态被拒绝。
+func TestJointSessionRestoreUndoValidation(t *testing.T) {
+	h := jointHistory()
+	tracks := []Track{
+		{Source: "cpu", Offset: OffsetRange{Min: -10, Max: 10}, Samples: []Sample{
+			jointSample("a", 95, 1, "cpu"),
+		}},
+	}
+	s := NewJointSession("s", tracks, h)
+	if err := s.SetAlignment("cpu", OffsetRange{Min: 0, Max: 0}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.Save()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreJointSession(tracks, h, data); err != nil {
+		t.Fatalf("valid undo history rejected: %v", err)
+	}
+
+	bad := []byte(`{"version":1,"label":"s","align":{},"undo":[{"source":"nope","old":{"min":0,"max":0},"new":{"min":0,"max":0}}]}`)
+	if _, err := RestoreJointSession(tracks, h, bad); err == nil {
+		t.Fatal("undo history with unknown source should fail")
+	}
+	bad = []byte(`{"version":1,"label":"s","align":{},"undo":[{"source":"cpu","old":{"min":-20,"max":0},"new":{"min":0,"max":0}}]}`)
+	if _, err := RestoreJointSession(tracks, h, bad); err == nil {
+		t.Fatal("undo history outside declared range should fail")
+	}
+}
+
 // 模块地址复用、符号更新与部分来源缺失都展示在对比报告中。
 func TestCompareRunsReuseSymbolsMissing(t *testing.T) {
 	h := jointHistory()
